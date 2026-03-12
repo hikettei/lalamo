@@ -111,10 +111,11 @@ class BenchmarkResult(NamedTuple):
     total_sequences: int
 
 # Note(hikettei)
-# I want "p_i" for all vocabs:
-# - (slower) compute llm inference online to get all probs
-# - (faster) store logsumexp during the trace, to compute full softmax
-# i guess i should transfer to faster method.
+# The metrics need full target probabilities p_i (all vocabs), not just top-K.
+# Two approaches:
+# - Online: run the target model during benchmark to get full logits (slower, but exact)
+# - Offline: store logsumexp during tracing, reconstruct full softmax from top-K + lse (faster)
+# Currently using the online approach. but we should transfer to offline approach ig
 def benchmark_speculator(
     model: LanguageModel,
     speculator: Speculator,
