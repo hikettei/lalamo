@@ -17,6 +17,7 @@ from lalamo.common import flatten_parameters, get_default_device_bytes
 from lalamo.data import load_hf_parquet, shuffle_dataset
 from lalamo.data.huggingface_message import HFMessage
 from lalamo.data.lalamo_completions import LalamoCompletion
+from lalamo.data.utils import get_prefixes_ending_in_user_message
 from lalamo.message_processor import AssistantMessage, Message
 from lalamo.model_import import ModelMetadata, ModelSpec, import_model
 from lalamo.model_import.common import (
@@ -34,6 +35,14 @@ from lalamo.models.lm_helpers import estimate_batchsize_from_bytes
 from lalamo.modules import config_converter
 from lalamo.safetensors import safe_write
 from lalamo.speculator.inference import CollectTracesEvent, inference_collect_traces
+from lalamo.speculator.benchmark import (
+    BenchmarkEvent,
+    BenchmarkResult,
+    GumbelCouplingMetric,
+    RejectionSamplingMetric,
+    SupportMassMetric,
+    benchmark_speculator,
+)
 from lalamo.speculator.ngram import NGramSpeculator
 from lalamo.speculator.utils import SpeculatorTrainingEvent, train_speculator
 
@@ -533,6 +542,95 @@ def train(
     with open(output_path, "wb") as fd:
         fd.write(speculator.serialize())
     callbacks.finished_saving_speculator()
+
+
+@dataclass
+class BenchmarkCallbacks:
+    model_path: Path
+    speculator_path: Path
+    dataset_path: Path
+    max_output_length: int
+    num_sequences: int | None
+
+    def loading_model(self) -> None:
+        pass
+
+    def finished_loading_model(self) -> None:
+        pass
+
+    def loading_dataset(self) -> None:
+        pass
+
+    def finished_loading_dataset(self) -> None:
+        pass
+
+    def benchmark_progress(self, benchmarked_tokens: int) -> None:
+        pass
+
+    def finished_benchmark(self, result: BenchmarkResult, metric_results: dict[str, float]) -> None:
+        pass
+
+
+def benchmark(
+    model_path: Path,
+    speculator_path: Path,
+    dataset_path: Path,
+    max_output_length: int = 1024,
+    num_sequences: int | None = None,
+    callbacks_type: Callable[
+        [Path, Path, Path, int, int | None],
+        BenchmarkCallbacks,
+    ] = BenchmarkCallbacks,
+) -> None:
+    callbacks = callbacks_type(
+        model_path,
+        speculator_path,
+        dataset_path,
+        max_output_length,
+        num_sequences,
+    )
+
+    callbacks.loading_model()
+    model = LanguageModelConfig.load_model(model_path)
+    callbacks.finished_loading_model()
+
+    with open(speculator_path, "rb") as fd:
+        speculator = NGramSpeculator.deserialize(fd.read())
+
+    callbacks.loading_dataset()
+    dataframe = shuffle_dataset(load_hf_parquet(dataset_path))
+    conversations = dataframe.get_column("conversation")
+    prefixes = chain.from_iterable(
+        get_prefixes_ending_in_user_message(
+            [HFMessage.from_dict(message).as_message() for message in conversation]
+        )
+        for conversation in conversations
+    )
+    prompts = [model.message_processor.tokenize_request(prefix) for prefix in prefixes]
+    if num_sequences is not None:
+        prompts = prompts[:num_sequences]
+    callbacks.finished_loading_dataset()
+
+    metrics = [
+        ("rejection_sampling", RejectionSamplingMetric()),
+        ("gumbel_coupling", GumbelCouplingMetric()),
+        ("support_mass", SupportMassMetric()),
+    ]
+
+    def progress_callback(event: BenchmarkEvent) -> None:
+        callbacks.benchmark_progress(event.benchmarked_tokens)
+
+    result = benchmark_speculator(
+        model,
+        speculator,
+        prompts,
+        [m for _, m in metrics],
+        max_output_length=max_output_length,
+        progress_callback=progress_callback,
+    )
+
+    metric_results = {name: metric.result() for name, metric in metrics}
+    callbacks.finished_benchmark(result, metric_results)
 
 
 @dataclass

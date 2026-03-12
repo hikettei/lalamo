@@ -36,6 +36,7 @@ from typer import Argument, Context, Exit, Option, Typer
 
 from lalamo.audio.utils import play_mono_audio
 from lalamo.commands import (
+    BenchmarkCallbacks,
     CollectTracesCallbacks,
     ConversionCallbacks,
     EstimateBatchsizeCallbacks,
@@ -46,6 +47,7 @@ from lalamo.commands import (
     TrainCallbacks,
     _suggest_similar_models,
 )
+from lalamo.commands import benchmark as _benchmark
 from lalamo.commands import collect_traces as _collect_traces
 from lalamo.commands import convert as _convert
 from lalamo.commands import estimate_batchsize as _estimate_batchsize
@@ -1152,6 +1154,106 @@ def train(
         ngram_size,
         subsample_size,
         CliTrainCallbacks,
+    )
+
+
+@dataclass
+class CliBenchmarkCallbacks(BenchmarkCallbacks):
+    stack: ExitStack = field(default_factory=ExitStack)
+    benchmark_task: TaskID | None = None
+
+    def loading_model(self) -> None:
+        self.progress = self.stack.enter_context(
+            Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+            ),
+        )
+        self.benchmark_task = self.progress.add_task(
+            "🔧 [cyan]Loading model...[/cyan]",
+            total=None,
+        )
+
+    def finished_loading_model(self) -> None:
+        assert self.benchmark_task is not None
+        self.progress.update(self.benchmark_task, description="✅ Model loaded")
+        self.progress.remove_task(self.benchmark_task)
+
+    def loading_dataset(self) -> None:
+        self.benchmark_task = self.progress.add_task(
+            "🗂️ [cyan]Loading dataset...[/cyan]",
+            total=None,
+        )
+
+    def finished_loading_dataset(self) -> None:
+        assert self.benchmark_task is not None
+        self.progress.remove_task(self.benchmark_task)
+        self.benchmark_task = self.progress.add_task(
+            "📊 [cyan]Benchmarking...[/cyan]",
+            total=None,
+        )
+
+    def benchmark_progress(self, benchmarked_tokens: int) -> None:
+        assert self.benchmark_task is not None
+        self.progress.update(self.benchmark_task, completed=benchmarked_tokens)
+
+    def finished_benchmark(self, result, metric_results: dict[str, float]) -> None:
+        self.stack.close()
+        table = Table(title="Benchmark Results", box=box.ROUNDED)
+        table.add_column("Metric")
+        table.add_column("Value")
+        table.add_row("Total sequences", str(result.total_sequences))
+        table.add_row("Total tokens", str(result.total_tokens))
+        for name, value in metric_results.items():
+            table.add_row(name, f"{value:.4f}")
+        console.print(table)
+
+
+@speculator_app.command(help="Benchmark a speculator against a target model")
+def benchmark(
+    model_path: Annotated[
+        Path,
+        Argument(
+            help="Path to the model directory",
+            metavar="MODEL_PATH",
+        ),
+    ],
+    speculator_path: Annotated[
+        Path,
+        Argument(
+            help="Path to the trained speculator file",
+            metavar="SPECULATOR_PATH",
+        ),
+    ],
+    dataset_path: Annotated[
+        Path,
+        Argument(
+            help="Path to the dataset with prompts",
+            metavar="DATASET_PATH",
+        ),
+    ],
+    max_output_length: Annotated[
+        int,
+        Option(help="Maximum number of tokens to generate per prompt"),
+    ] = 1024,
+    num_sequences: Annotated[
+        int | None,
+        Option(
+            help="Maximum number of sequences to benchmark",
+            show_default="all",
+        ),
+    ] = None,
+) -> None:
+    _benchmark(
+        model_path,
+        speculator_path,
+        dataset_path,
+        max_output_length,
+        num_sequences,
+        CliBenchmarkCallbacks,
     )
 
 
