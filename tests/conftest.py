@@ -43,6 +43,7 @@ def _gpu_tolerance() -> Generator[None]:
     else:
         yield
 
+
 RunLalamo = Callable[..., str]
 ConvertModel = Callable[[str], Path]
 
@@ -53,23 +54,20 @@ ALL_MODEL_SPECS: tuple[ModelSpec, ...] = ModelRegistry.build(allow_third_party_p
 LLM_SPECS: tuple[ModelSpec, ...] = tuple(
     spec for spec in ALL_MODEL_SPECS if spec.model_type == ModelType.LANGUAGE_MODEL
 )
+TTS_SPECS: tuple[ModelSpec, ...] = tuple(spec for spec in ALL_MODEL_SPECS if spec.model_type == ModelType.TTS_MODEL)
 
-TTS_SPECS: tuple[ModelSpec, ...] = tuple(
-    spec for spec in ALL_MODEL_SPECS if spec.model_type == ModelType.TTS_MODEL
+_CORE_LLM_REPOS: frozenset[str] = frozenset(
+    {
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        "LiquidAI/LFM2-700M",
+        "google/gemma-3-1b-it",
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "cartesia-ai/Llamba-1B",
+        "mlx-community/Qwen3.5-0.8B-MLX-4bit",
+    }
 )
 
-_CORE_LLM_REPOS: frozenset[str] = frozenset({
-    "Qwen/Qwen2.5-0.5B-Instruct",
-    "LiquidAI/LFM2-700M",
-    "google/gemma-3-1b-it",
-    "meta-llama/Llama-3.2-1B-Instruct",
-    "cartesia-ai/Llamba-1B",
-    "mlx-community/Qwen3.5-0.8B-MLX-4bit",
-})
-
-CORE_LLM_SPECS: tuple[ModelSpec, ...] = tuple(
-    spec for spec in LLM_SPECS if spec.repo in _CORE_LLM_REPOS
-)
+CORE_LLM_SPECS: tuple[ModelSpec, ...] = tuple(spec for spec in LLM_SPECS if spec.repo in _CORE_LLM_REPOS)
 
 
 def strip_ansi_escape(text: str) -> str:
