@@ -8,7 +8,9 @@ from lalamo.data.lalamo_completions import LalamoCompletion
 from lalamo.data.utils import get_prefixes_ending_in_user_message
 from lalamo.message_processor import Message
 from lalamo.models import LanguageModel
+from lalamo.models.batch_scheduler import ContinuousBatchScheduler
 from lalamo.models.common import InferenceConfig
+from lalamo.modules import MLPForwardPassConfig
 
 
 class CollectTracesEvent(NamedTuple):
@@ -38,16 +40,21 @@ def inference_collect_traces(
     tokens_generated = 0
     sequences_processed = 0
     key = jax.random.key(0)
+    scheduler = ContinuousBatchScheduler(model=model)
+    chunk_size = batch_size * 256
 
-    for prefix_batch in batched(filtered_prefixes, batch_size):
-        keys = jax.random.split(key, len(prefix_batch) + 1)
+    for prefix_chunk in batched(filtered_prefixes, chunk_size):
+        keys = jax.random.split(key, len(prefix_chunk) + 1)
         key = keys[0]
-        generated_batch = model.generate_tokens_many(
-            prefix_batch,
+        generated_batch = scheduler.generate_tokens_many(
+            prefix_chunk,
+            generation_config=model.config.generation_config,
             inference_config=config,
+            forward_pass_config=MLPForwardPassConfig(),
             keys=keys[1:],
         )
-        for prefix_token_ids, generated in zip(prefix_batch, generated_batch, strict=True):
+        for prefix_idx, generated in generated_batch:
+            prefix_token_ids = prefix_chunk[prefix_idx]
             token_ids = generated.token_ids.tolist()
             seqlen = next(
                 (i + 1 for i, t in enumerate(token_ids) if t in model.stop_token_ids),

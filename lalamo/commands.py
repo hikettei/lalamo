@@ -8,6 +8,7 @@ from enum import Enum
 from itertools import chain
 from pathlib import Path
 
+import jax
 import polars as pl
 import requests
 import thefuzz.fuzz
@@ -29,10 +30,16 @@ from lalamo.model_import.common import (
     StatusEvent,
 )
 from lalamo.model_import.remote_registry import RegistryModel, RegistryModelFile
+from lalamo.model_registry import ModelRegistry
 from lalamo.models import GenerationConfig, LanguageModelConfig
+from lalamo.models.batch_scheduler import (
+    ContinuousBatchScheduler,
+    FixedBatchScheduler,
+    SchedulerKind,
+)
 from lalamo.models.common import BatchSizesComputedEvent, InferenceConfig
-from lalamo.models.lm_helpers import estimate_batchsize_from_bytes
-from lalamo.modules import config_converter
+from lalamo.models.lm_helpers import estimate_batchsize_for_memory_budget
+from lalamo.modules import MLPForwardPassConfig, config_converter
 from lalamo.modules.common import ShardingConfig, use_sharding
 from lalamo.safetensors import safe_write
 from lalamo.speculator.inference import CollectTracesEvent, inference_collect_traces
@@ -171,7 +178,7 @@ class ConversionCallbacks:
 
 
 def convert(
-    model_spec: ModelSpec,
+    model_spec: ModelSpec | str,
     output_dir: Path,
     precision: Precision | None = None,
     context_length: int | None = None,
@@ -185,6 +192,12 @@ def convert(
         ConversionCallbacks,
     ] = ConversionCallbacks,
 ) -> None:
+    if isinstance(model_spec, str):
+        try:
+            model_spec = ModelRegistry.build().repo_to_model[model_spec]
+        except KeyError as e:
+            raise ValueError(f"Unknown model: {model_spec}") from e
+
     callbacks = callbacks_type(
         model_spec,
         output_dir,
@@ -310,13 +323,7 @@ class EstimateBatchsizeCallbacks:
     max_output_length: int
     mem: int
 
-    def loading_model(self) -> None:
-        pass
-
-    def finished_loading_model(self) -> None:
-        pass
-
-    def estimating_batchsize(self, lo: int, hi: int | None) -> None:
+    def estimating_batchsize(self, batchsize: int, step: int, num_steps: int) -> None:
         pass
 
     def finished_estimating_batchsize(self, batchsize: int) -> None:
@@ -339,26 +346,32 @@ def estimate_batchsize(
     ] = EstimateBatchsizeCallbacks,
 ) -> int:
     callbacks = callbacks_type(model_path, max_input_length, max_output_length, mem)
-
-    callbacks.loading_model()
     model = LanguageModelConfig.load_model(model_path)
-    callbacks.finished_loading_model()
-
-    def memory_per_batchsize(batch_size: int) -> int:
-        inference_config = InferenceConfig(
-            max_output_length=max_output_length,
-            padded_length=max_input_length,
-            batch_size=batch_size,
-        )
-        return model.estimate_memory_consumption(
-            inference_config=inference_config,
-        )
-
-    bs = estimate_batchsize_from_bytes(
-        memory_per_batchsize,
-        mem,
-        lambda event: callbacks.estimating_batchsize(event.lo, event.hi),
+    inference_config = InferenceConfig(
+        max_output_length=max_output_length,
+        padded_length=max_input_length,
     )
+    probe_sequence = [0] * max_input_length
+    current_step = [0]
+
+    scheduler = FixedBatchScheduler(model)
+
+    def memory_probe(batchsize: int) -> None:
+        callbacks.estimating_batchsize(batchsize, current_step[0], 2)
+        current_step[0] += 1
+
+        results = scheduler.generate_tokens_many(
+            [probe_sequence] * batchsize,
+            generation_config=GenerationConfig(),
+            inference_config=dataclasses.replace(inference_config, batch_size=batchsize),
+            forward_pass_config=MLPForwardPassConfig(),
+            fast_peak_memory=True,
+        )
+        first_result = next(results, None)
+        if first_result is not None:
+            jax.block_until_ready(first_result)
+
+    bs = estimate_batchsize_for_memory_budget(memory_probe, mem)
 
     callbacks.finished_estimating_batchsize(bs)
     return bs
@@ -544,7 +557,7 @@ class GenerateRepliesCallbacks:
     def finished_loading_dataset(self) -> None:
         pass
 
-    def estimating_batchsize(self, sequence_length: int, lo: int, hi: int | None) -> None:
+    def estimating_batchsize(self, batchsize: int, step: int, num_steps: int) -> None:
         pass
 
     def batch_sizes_estimated(self) -> None:
@@ -567,6 +580,7 @@ def generate_replies(
     max_vram: int | None,
     max_output_length: int = 8192,
     batch_size: int | None = None,
+    scheduler_kind: SchedulerKind = SchedulerKind.FIXED,
     generation_config_override: GenerationConfig | None = None,
     callbacks_type: Callable[
         [
@@ -657,10 +671,16 @@ def generate_replies(
             stop_token_ids=model.config.generation_config.stop_token_ids,
         )
 
+    match scheduler_kind:
+        case SchedulerKind.FIXED:
+            scheduler = FixedBatchScheduler(model=model)
+        case SchedulerKind.CONTINUOUS:
+            scheduler = ContinuousBatchScheduler(model=model)
+
     with use_sharding(sharding_config):
         replies: list[tuple[int, AssistantMessage]] = []
         for rows_processed, (idx, reply) in enumerate(
-            model.reply_many(
+            scheduler.reply_many(
                 dataset,
                 generation_config=generation_config,
                 inference_config=inference_config,

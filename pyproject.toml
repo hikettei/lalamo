@@ -22,7 +22,6 @@ dependencies = [
     # "jax-metal>=0.1.1 ; sys_platform == 'darwin'",
     "requests>=2.32.5",
     "soundfile>=0.13.1",
-    "transformers>=5.5",
 ]
 readme = { file = "README.md", content-type = "text/markdown" }
 dynamic = ["version"]
@@ -32,7 +31,7 @@ cpu = ["jax[cpu]>=0.8.1"]
 cuda = ["jax[cuda]>=0.8.1"]
 tpu = ["jax[tpu]>=0.8.1"]
 pyaudio = ["pyaudio>=0.2.0"] # requires PortAudio to be installed, more info: https://pypi.org/project/PyAudio/
-fishaudio = ["torch>=2.8.0", "transformers>=5.2.0", "tiktoken>=0.12.0", "blobfile>=3.1.0"]
+fishaudio = ["torch>=2.8.0", "transformers>=5.5.0", "tiktoken>=0.12.0", "blobfile>=3.1.0"]
 nanocodec = ["torch>=2.8.0"]
 server = ["fastapi>=0.135.3", "uvicorn>=0.44.0"]
 
@@ -53,7 +52,7 @@ dev = [
     "torch>=2.8.0",
     "torchaudio>=2.8.0",
     "torchao>=0.7.0",
-    "transformers>=5.2.0",
+    "transformers>=5.5",
     "twine>=6.1.0",
     "ruff>=0.14.0",
     "ty>=0.0.4",

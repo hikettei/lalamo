@@ -3,7 +3,7 @@ import pytest
 
 from lalamo.message_processor import UserMessage
 from lalamo.model_import.model_specs.common import ModelType
-from lalamo.models import LanguageModel
+from lalamo.models import FixedBatchScheduler, LanguageModel
 from lalamo.models.common import InferenceConfig
 from lalamo.models.language_model import GenerationConfig, LanguageModelConfig
 from tests.conftest import ConvertModel, filter_specs, mark_by_size
@@ -137,8 +137,9 @@ def test_streaming_vs_eager_consistency(language_model: LanguageModel) -> None:
         streaming_token_ids.squeeze().tolist(),
     )
 
+    scheduler = FixedBatchScheduler(model=language_model)
     [(idx, batch_response)] = list(
-        language_model.reply_many(
+        scheduler.reply_many(
             [prompt],
             generation_config=generation_config,
             inference_config=InferenceConfig(batch_size=1, max_output_length=10),

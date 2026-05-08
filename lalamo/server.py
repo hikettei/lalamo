@@ -18,9 +18,10 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from jax import numpy as jnp
 
-from lalamo import import_model
+from lalamo import LanguageModel, import_model
 from lalamo.data.huggingface_message import HFMessage
-from lalamo.models import GenerationConfig
+from lalamo.model_registry import ModelRegistry
+from lalamo.models import ContinuousBatchScheduler, GenerationConfig
 from lalamo.models.common import InferenceConfig
 
 BatchStatus = Literal["in_progress", "completed", "failed"]
@@ -147,7 +148,12 @@ def validate_requests(
 def generate_replies(requests: list[RequestBody]) -> Iterator[ResponseBody]:
     reference, *_ = requests
 
-    model, _metadata = import_model(reference.model, precision=reference.precision)
+    try:
+        model_spec = ModelRegistry.build().repo_to_model[reference.model]
+    except KeyError as e:
+        raise ValueError(f"Unknown model: {reference.model}") from e
+
+    model, _metadata = import_model(model_spec, precision=reference.precision)
 
     dataset = [[hf_message.as_message() for hf_message in request.messages] for request in requests]
 
@@ -160,7 +166,10 @@ def generate_replies(requests: list[RequestBody]) -> Iterator[ResponseBody]:
 
     sequence_ids = [request.sequence_id for request in requests]
 
-    for reply_idx, reply in model.reply_many(  # type: ignore[possibly-missing-attribute]
+    assert isinstance(model, LanguageModel)
+    scheduler = ContinuousBatchScheduler(model=model)
+
+    for reply_idx, reply in scheduler.reply_many(
         dataset,
         generation_config=reference.generation_config,
         inference_config=InferenceConfig(reference.max_completion_tokens),

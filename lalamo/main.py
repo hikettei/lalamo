@@ -64,6 +64,7 @@ from lalamo.model_import.common import FileSpec
 from lalamo.model_import.remote_registry import RegistryModel, RegistryModelFile, fetch_available_models
 from lalamo.model_registry import ModelRegistry
 from lalamo.models import ClassifierModelConfig, LanguageModelConfig
+from lalamo.models.batch_scheduler import SchedulerKind
 from lalamo.models.common import BatchSizesComputedEvent
 from lalamo.models.tts_model import TTSGenerator, TTSMessage
 from lalamo.speculator.ngram import NGramSpeculator
@@ -694,12 +695,9 @@ class CliGenerateRepliesCallbacks(GenerateRepliesCallbacks):
         assert self.loading_task is not None
         self.progress.remove_task(self.loading_task)
 
-    def estimating_batchsize(self, sequence_length: int, lo: int, hi: int | None) -> None:
+    def estimating_batchsize(self, batchsize: int, step: int, num_steps: int) -> None:
         assert self.progress is not None
-        hi_str = str(hi) if hi is not None else "?"
-        description = (
-            f"📐 [cyan]Computing batch size for the prompt length of {sequence_length}... ({lo}..{hi_str})[/cyan]"
-        )
+        description = f"📐 [cyan]Estimating batch size with probe batch={batchsize} ({step + 1}/{num_steps})[/cyan]"
         if self.estimating_task is None:
             self.estimating_task = self.progress.add_task(description)
         else:
@@ -779,6 +777,10 @@ def generate_replies(
         int | None,
         Option(help="Fixed batch size to use, skipping automatic estimation."),
     ] = None,
+    scheduler: Annotated[
+        SchedulerKind,
+        Option(help="Batch scheduling strategy."),
+    ] = SchedulerKind.FIXED,
 ) -> None:
     if batch_size is not None and vram_gb is not None:
         err_console.print("Cannot use both --batch-size and --vram-gb")
@@ -801,6 +803,7 @@ def generate_replies(
         max_vram=max_vram,
         max_output_length=max_output_length,
         batch_size=batch_size,
+        scheduler_kind=scheduler,
         callbacks_type=CliGenerateRepliesCallbacks,
     )
 
@@ -855,34 +858,25 @@ app.add_typer(speculator_app, name="speculator", help="Train a speculator for a 
 @dataclass
 class CliEstimateBatchsizeCallbacks(EstimateBatchsizeCallbacks):
     stack: ExitStack = field(default_factory=ExitStack)
-    loading_task: TaskID | None = None
+    progress: Progress | None = None
     estimating_task: TaskID | None = None
 
-    def loading_model(self) -> None:
-        self.progress = self.stack.enter_context(
-            Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                transient=True,
-            ),
-        )
-        self.loading_task = self.progress.add_task("[cyan]Loading model...[/cyan]")
-
-    def finished_loading_model(self) -> None:
-        assert self.loading_task is not None
-        self.progress.remove_task(self.loading_task)
-
-    def estimating_batchsize(self, lo: int, hi: int | None) -> None:
-        hi_str = str(hi) if hi is not None else "?"
-        description = f"[cyan]Estimating batch size... ({lo}..{hi_str})[/cyan]"
+    def estimating_batchsize(self, batchsize: int, step: int, num_steps: int) -> None:
+        description = f"[cyan]Estimating batch size with probe batch={batchsize} ({step + 1}/{num_steps})[/cyan]"
+        if self.progress is None:
+            self.progress = self.stack.enter_context(
+                Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    transient=True,
+                ),
+            )
         if self.estimating_task is None:
             self.estimating_task = self.progress.add_task(description)
         else:
             self.progress.update(self.estimating_task, description=description)
 
     def finished_estimating_batchsize(self, batchsize: int) -> None:
-        if self.estimating_task is not None:
-            self.progress.remove_task(self.estimating_task)
         self.stack.close()
         console.print(f"Found maximum batch size: [cyan]{batchsize}[/cyan]")
 
