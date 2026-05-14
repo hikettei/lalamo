@@ -22,6 +22,7 @@ from lalamo.module import ForwardPassMode, Keychain
 from lalamo.modules import DecoderForwardPassConfig, State
 from lalamo.modules.utils import call_vmapped
 from lalamo.sampling import SamplingPolicy
+from lalamo.speculator.common import Speculator
 
 __all__ = [
     "BatchScheduler",
@@ -666,6 +667,7 @@ class BatchScheduler(ABC):
         batch_scheduler_config: BatchSchedulerConfig = BatchSchedulerConfig(),
         *,
         fast_peak_memory: bool = False,
+        speculator: Speculator | None = None,
         keychain: Keychain | None = None,
     ) -> Iterator[tuple[int, GeneratedSequence]]: ...
 
@@ -675,6 +677,7 @@ class BatchScheduler(ABC):
         generation_config: GenerationConfig | None = None,
         batch_scheduler_config: BatchSchedulerConfig = BatchSchedulerConfig(),
         *,
+        speculator: Speculator | None = None,
         keychain: Keychain | None = None,
         vram_bytes: int | None = None,
         batch_sizes_callback: Callable[[BatchSizesComputedEvent], None] | None = None,
@@ -707,6 +710,7 @@ class BatchScheduler(ABC):
                         padded_length=padded_length,
                     ),
                     fast_peak_memory=True,
+                    speculator=speculator,
                 )
                 first_result = next(iterator, None)
                 if first_result is not None:
@@ -752,6 +756,7 @@ class BatchScheduler(ABC):
                 generation_config=generation_config,
                 batch_scheduler_config=bucket_config,
                 fast_peak_memory=False,
+                speculator=speculator,
                 keychain=bucket_keychain,
             ):
                 idx = sequence_ids[local_idx]
@@ -768,6 +773,7 @@ class FixedSizeBatchScheduler(BatchScheduler):
         batch_scheduler_config: BatchSchedulerConfig = BatchSchedulerConfig(),
         *,
         fast_peak_memory: bool = False,
+        speculator: Speculator | None = None,
         keychain: Keychain | None = None,
     ) -> Iterator[tuple[int, GeneratedSequence]]:
         tokenized = list(tokenized)
@@ -798,6 +804,7 @@ class FixedSizeBatchScheduler(BatchScheduler):
                     prompt_lengths_without_padding=lengths,
                     max_output_length=batch_scheduler_config.max_output_length,
                     num_top_logits_to_return=batch_scheduler_config.num_top_logits_to_return,
+                    speculator=speculator,
                     keychain=batch_keychain,
                 )
                 for local_idx, sequence_id in enumerate(batch_indices):
@@ -838,8 +845,19 @@ class ContinuousBatchScheduler(BatchScheduler):
         batch_scheduler_config: BatchSchedulerConfig = BatchSchedulerConfig(),
         *,
         fast_peak_memory: bool = False,
+        speculator: Speculator | None = None,
         keychain: Keychain | None = None,
     ) -> Iterator[tuple[int, GeneratedSequence]]:
+        if speculator is not None:
+            yield from FixedSizeBatchScheduler(model=self.model).generate_tokens_many(
+                tokenized,
+                generation_config=generation_config,
+                batch_scheduler_config=batch_scheduler_config,
+                fast_peak_memory=fast_peak_memory,
+                speculator=speculator,
+                keychain=keychain,
+            )
+            return
         if batch_scheduler_config.num_top_logits_to_return is not None:
             raise RuntimeError("num_top_logits_to_return is not supported with ContinuousBatchScheduler.")
 

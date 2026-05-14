@@ -10,6 +10,7 @@ from lalamo.data.utils import get_prefixes_ending_in_user_message, pad_sequences
 from lalamo.models import LanguageModel
 from lalamo.models.chat_codec import Message
 from lalamo.module import Keychain
+from lalamo.speculator.common import Speculator
 
 
 class CollectTracesEvent(NamedTuple):
@@ -25,6 +26,7 @@ def inference_collect_traces(
     max_input_length: int = 1024,
     max_output_length: int = 4096,
     tokens_to_generate: int | None = None,
+    speculator: Speculator | None = None,
     progress_callback: Callable[[CollectTracesEvent], None] | None = None,
 ) -> Iterable[LalamoCompletion]:
     prefixes = chain.from_iterable(map(get_prefixes_ending_in_user_message, conversations))
@@ -43,6 +45,7 @@ def inference_collect_traces(
             padded_prefixes,
             prompt_lengths_without_padding=prefix_lengths,
             max_output_length=max_output_length,
+            speculator=speculator,
             keychain=Keychain(vmapped_keys=batch_key, batch_key=batch_key),
         )
         for row_index, prefix_token_ids in enumerate(prefix_batch):

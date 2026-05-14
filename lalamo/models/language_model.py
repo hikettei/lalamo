@@ -57,16 +57,24 @@ class Chunk(eqx.Module):
 
 
 class DecodingState(NamedTuple):
+    last_token_logits: Float[Array, "batch vocabulary"]
+    last_token_indices: Int[Array, " batch"]
+    state: State
+    stop_flags: Bool[Array, " batch"]
+    sampling_policy: SamplingPolicy
+
+
+class GenerationState(NamedTuple):
     sampling_policy: SamplingPolicy
     lm_state: LMState
     speculator_state: SpeculatorState
 
 
 class DecodingSetup(NamedTuple):
-    initial_state: DecodingState
+    initial_state: GenerationState
     decoding_keys: Key[Array, "steps ..."]
-    step: Callable[[DecodingState, Key[Array, "..."]], tuple[DecodingState, AcceptedProposal]]
-    is_done: Callable[[DecodingState], Bool[Array, " batch"]]
+    step: Callable[[GenerationState, Key[Array, "..."]], tuple[GenerationState, AcceptedProposal]]
+    is_done: Callable[[GenerationState], Bool[Array, " batch"]]
 
 
 class GenerationResults(NamedTuple):
@@ -352,7 +360,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             sampling_policy,
             per_position_keys[:, 0],
         )
-        initial_state = DecodingState(
+        initial_state = GenerationState(
             sampling_policy=sampling_policy,
             lm_state=initial_lm_state,
             speculator_state=active_speculator.init_state(
@@ -374,13 +382,13 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             eos_hits = jnp.any(token_ids[:, :, None] == eos_token_ids[None, None, :], axis=-1)
             return jnp.any(token_mask & eos_hits, axis=1)
 
-        def is_done(state: DecodingState) -> Bool[Array, " batch"]:
+        def is_done(state: GenerationState) -> Bool[Array, " batch"]:
             return stop_flags(state.lm_state) | (output_lengths(state.lm_state) >= max_output_length)
 
         def decode_step(
-            state: DecodingState,
+            state: GenerationState,
             decoding_key: Key[Array, "..."],
-        ) -> tuple[DecodingState, AcceptedProposal]:
+        ) -> tuple[GenerationState, AcceptedProposal]:
             lm_state = state.lm_state
             current_output_lengths = output_lengths(lm_state)
             done = is_done(state)
@@ -443,7 +451,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
                 sampling_top_k_logits=sampling_top_k_logits,
             )
             return (
-                DecodingState(
+                GenerationState(
                     sampling_policy=next_sampling_policy,
                     lm_state=next_lm_state,
                     speculator_state=active_speculator.update_state(
@@ -499,13 +507,13 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             prompt_lengths_without_padding = jnp.full((batch_size,), prompt_length, dtype=jnp.int32)
 
         def scan_step(
-            state: DecodingState,
+            state: GenerationState,
             decoding_key: Key[Array, "..."],
-        ) -> tuple[DecodingState, Int[Array, " batch"]]:
+        ) -> tuple[GenerationState, Int[Array, " batch"]]:
             def decode_step(
-                state: DecodingState,
+                state: GenerationState,
                 decoding_key: Key[Array, "..."],
-            ) -> tuple[DecodingState, Int[Array, " batch"]]:
+            ) -> tuple[GenerationState, Int[Array, " batch"]]:
                 next_state, accepted = setup.step(state, decoding_key)
                 return next_state, accepted.num_compact_indices
 
