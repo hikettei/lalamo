@@ -167,7 +167,7 @@ class TrieProposal(eqx.Module):
     ) -> ProposalInputs:
         token_positions = next_token_positions[:, None] + self.depths
         forward_pass_mode = ForwardPassMode.MULTI_TOKEN
-        if self.batch_size == 1 and self.num_nodes == 1:
+        if self.num_nodes == 1:
             forward_pass_mode = ForwardPassMode.SINGLE_TOKEN
         attention_parent_indices = None
         if self.num_nodes > 1:

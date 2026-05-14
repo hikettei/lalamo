@@ -4,7 +4,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 from annotated_types import Ge
-from jaxtyping import Array, Bool, Float, Int, Key
+from jaxtyping import Array, Bool, DTypeLike, Float, Int, Key
 
 from lalamo.modules.decoder import DecoderActivationTrace, DecoderResult
 from lalamo.modules.token_mixer import State
@@ -52,7 +52,7 @@ class RingBuffer(eqx.Module):
     length: Int[Array, " batch"]
 
     @classmethod
-    def empty(cls, batch_size: int, capacity: int, row_shape: tuple[int, ...], dtype: jnp.dtype) -> "RingBuffer":
+    def empty(cls, batch_size: int, capacity: int, row_shape: tuple[int, ...], dtype: DTypeLike) -> "RingBuffer":
         return cls(
             values=jnp.zeros((batch_size, capacity, *row_shape), dtype=dtype),
             length=jnp.zeros((batch_size,), dtype=jnp.int32),
@@ -373,10 +373,12 @@ class LMState(eqx.Module):
     ) -> "LMState":
         updated_state = decoder_result.updated_state
         assert updated_state is not None, "updated_state should not be None"
-        first_layer = self.kv_cache[0]
-        if not isinstance(first_layer, StaticKVCacheLayer):
-            raise TypeError(f"speculative decoding requires StaticKVCacheLayer, got {type(first_layer).__name__}")
         if accepted.compact_indices.shape[1] > 1:
+            first_layer = self.kv_cache[0]
+            if not isinstance(first_layer, StaticKVCacheLayer):
+                raise TypeError(
+                    f"tree proposal compaction requires StaticKVCacheLayer, got {type(first_layer).__name__}",
+                )
             kv_cache = compact_state_layers(
                 updated_state,
                 cache_len=first_layer.current_length,

@@ -24,7 +24,7 @@ from lalamo.modules import (
 from lalamo.modules.token_mixer import State
 from lalamo.modules.utils import call_vmapped
 from lalamo.sampling import SamplingPolicy
-from lalamo.speculator.common import Speculator, SpeculatorState
+from lalamo.speculator.common import NoSpeculator, Speculator, SpeculatorState
 from lalamo.speculator.state import LMState, MemoryBuffers, StateRequest
 
 __all__ = [
@@ -57,23 +57,9 @@ class Chunk(eqx.Module):
 
 
 class DecodingState(NamedTuple):
-    last_token_logits: Float[Array, "batch vocabulary"]
-    last_token_indices: Int[Array, " batch"]
-    state: State
-    stop_flags: Bool[Array, " batch"]
-    sampling_policy: SamplingPolicy
-
-
-class SpeculativeDecodingState(NamedTuple):
     sampling_policy: SamplingPolicy
     lm_state: LMState
     speculator_state: SpeculatorState
-
-
-class GenerationStepResults(NamedTuple):
-    token_ids: Int[Array, " batch"]
-    top_k_token_ids: Int[Array, " batch k"] | None
-    top_k_token_logits: Float[Array, " batch k"] | None
 
 
 class GenerationResults(NamedTuple):
@@ -304,26 +290,18 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             prompt_lengths_without_padding,
         )
 
-    def _speculative_forward_pass_config(
-        self,
-        forward_pass_mode: ForwardPassMode,
-        decode_forward_pass_config: DecoderForwardPassConfig | None,
-    ) -> DecoderForwardPassConfig:
-        if decode_forward_pass_config is not None:
-            return decode_forward_pass_config
-        return DecoderForwardPassConfig.for_inference(forward_pass_mode)
-
-    def _generate_tokens_with_speculator(
+    @eqx.filter_jit
+    def generate_tokens(
         self,
         prompt_token_ids: Int[Array, "batch prompt_tokens"],
-        generation_config: GenerationConfig | None,
-        prompt_lengths_without_padding: Int[Array, " batch"] | None,
-        max_output_length: int,
-        eos_token_ids: Int[Array, " eos_tokens"] | None,
-        num_top_logits_to_return: int | None,
-        prefill_forward_pass_config: DecoderForwardPassConfig | None,
-        decode_forward_pass_config: DecoderForwardPassConfig | None,
-        speculator: Speculator,
+        generation_config: GenerationConfig | None = None,
+        prompt_lengths_without_padding: Int[Array, " batch"] | None = None,
+        max_output_length: int = 8192,
+        eos_token_ids: Int[Array, " eos_tokens"] | None = None,
+        num_top_logits_to_return: int | None = None,
+        prefill_forward_pass_config: DecoderForwardPassConfig | None = None,
+        decode_forward_pass_config: DecoderForwardPassConfig | None = None,
+        speculator: Speculator | None = None,
         *,
         keychain: Keychain,
     ) -> GenerationResults:
@@ -332,6 +310,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
         if prefill_forward_pass_config is None:
             prefill_forward_pass_config = DecoderForwardPassConfig.for_inference()
 
+        active_speculator: Speculator = speculator if speculator is not None else NoSpeculator()
         batch_size, prompt_length = prompt_token_ids.shape
         if prompt_lengths_without_padding is None:
             prompt_lengths_without_padding = jnp.full((batch_size,), prompt_length, dtype=jnp.int32)
@@ -343,7 +322,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             prompt_lengths_without_padding,
         )
         state_request = self.state_request_for_generation(
-            speculator,
+            active_speculator,
             num_top_logits_to_return,
             max_output_length,
         )
@@ -367,10 +346,10 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             sampling_policy,
             per_position_keys[:, 0],
         )
-        initial_state = SpeculativeDecodingState(
+        initial_state = DecodingState(
             sampling_policy=sampling_policy,
             lm_state=initial_lm_state,
-            speculator_state=speculator.init_state(
+            speculator_state=active_speculator.init_state(
                 prompt_token_ids,
                 prompt_lengths_without_padding,
                 max_output_length,
@@ -389,18 +368,21 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             eos_hits = jnp.any(token_ids[:, :, None] == eos_token_ids[None, None, :], axis=-1)
             return jnp.any(token_mask & eos_hits, axis=1)
 
-        def is_done(state: SpeculativeDecodingState) -> Bool[Array, " batch"]:
+        def is_done(state: DecodingState) -> Bool[Array, " batch"]:
             return stop_flags(state.lm_state) | (output_lengths(state.lm_state) >= max_output_length)
 
         def decode_step(
-            state: SpeculativeDecodingState,
+            state: DecodingState,
             decoding_key: Key[Array, "..."],
-        ) -> tuple[SpeculativeDecodingState, Int[Array, " batch"]]:
+        ) -> tuple[DecodingState, Int[Array, " batch"]]:
             lm_state = state.lm_state
             current_output_lengths = output_lengths(lm_state)
             done = is_done(state)
-            proposal, draft_state = speculator.draft(lm_state, state.speculator_state)
+            proposal, draft_state = active_speculator.draft(lm_state, state.speculator_state)
             proposal_inputs = proposal.forward_inputs(lm_state.next_token_position)
+            forward_pass_config = decode_forward_pass_config
+            if forward_pass_config is None:
+                forward_pass_config = DecoderForwardPassConfig.for_inference(proposal_inputs.forward_pass_mode)
             decoder_result = self.decoder(
                 token_ids=proposal_inputs.token_ids,
                 token_positions=proposal_inputs.token_positions,
@@ -408,10 +390,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
                 return_updated_state=True,
                 return_activation_trace=state_request.requires_activation_trace,
                 lengths_without_padding=proposal_inputs.lengths_without_padding,
-                forward_pass_config=self._speculative_forward_pass_config(
-                    proposal_inputs.forward_pass_mode,
-                    decode_forward_pass_config,
-                ),
+                forward_pass_config=forward_pass_config,
                 attention_parent_indices=proposal_inputs.attention_parent_indices,
                 keychain=Keychain(vmapped_keys=decoding_key, batch_key=decoding_keychain.batch_key),
             )
@@ -458,10 +437,10 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
                 sampling_top_k_logits=sampling_top_k_logits,
             )
             return (
-                SpeculativeDecodingState(
+                DecodingState(
                     sampling_policy=next_sampling_policy,
                     lm_state=next_lm_state,
-                    speculator_state=speculator.update_state(
+                    speculator_state=active_speculator.update_state(
                         state.speculator_state,
                         draft_state,
                         accepted,
@@ -472,9 +451,9 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             )
 
         def scan_step(
-            state: SpeculativeDecodingState,
+            state: DecodingState,
             decoding_key: Key[Array, "..."],
-        ) -> tuple[SpeculativeDecodingState, Int[Array, " batch"]]:
+        ) -> tuple[DecodingState, Int[Array, " batch"]]:
             return jax.lax.cond(
                 jnp.all(is_done(state)),
                 lambda state, _: (state, jnp.zeros((batch_size,), dtype=jnp.int32)),
@@ -505,162 +484,6 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             top_k_mask = top_k_mask[:, :, None]
             top_k_token_ids = jnp.where(top_k_mask, top_k_token_ids, jnp.zeros_like(top_k_token_ids))
             top_k_token_logits = jnp.where(top_k_mask, top_k_token_logits, jnp.zeros_like(top_k_token_logits))
-
-        return GenerationResults(
-            token_ids=token_ids,
-            top_k_token_ids=top_k_token_ids,
-            top_k_token_logits=top_k_token_logits,
-        )
-
-    @eqx.filter_jit
-    def generate_tokens(
-        self,
-        prompt_token_ids: Int[Array, "batch prompt_tokens"],
-        generation_config: GenerationConfig | None = None,
-        prompt_lengths_without_padding: Int[Array, " batch"] | None = None,
-        max_output_length: int = 8192,
-        eos_token_ids: Int[Array, " eos_tokens"] | None = None,
-        num_top_logits_to_return: int | None = None,
-        prefill_forward_pass_config: DecoderForwardPassConfig | None = None,
-        decode_forward_pass_config: DecoderForwardPassConfig | None = None,
-        speculator: Speculator | None = None,
-        *,
-        keychain: Keychain,
-    ) -> GenerationResults:
-        if speculator is not None:
-            return self._generate_tokens_with_speculator(
-                prompt_token_ids,
-                generation_config,
-                prompt_lengths_without_padding,
-                max_output_length,
-                eos_token_ids,
-                num_top_logits_to_return,
-                prefill_forward_pass_config,
-                decode_forward_pass_config,
-                speculator,
-                keychain=keychain,
-            )
-
-        if max_output_length < 1:
-            raise ValueError("max_output_length must be at least 1.")
-        if prefill_forward_pass_config is None:
-            prefill_forward_pass_config = DecoderForwardPassConfig.for_inference()
-        if decode_forward_pass_config is None:
-            decode_forward_pass_config = DecoderForwardPassConfig.for_inference(ForwardPassMode.SINGLE_TOKEN)
-
-        batch_size, prompt_length = prompt_token_ids.shape
-        sampling_policy = self.default_sampling_policy()
-        if generation_config is not None:
-            sampling_policy = generation_config.default_policy()
-        use_count_penalties = sampling_policy.has_count_penalties
-        sampling_policy = sampling_policy.broadcast(batch_size)
-        if prompt_lengths_without_padding is None:
-            prompt_lengths_without_padding = jnp.full((batch_size,), prompt_length, dtype=jnp.int32)
-        if use_count_penalties:
-            sampling_policy = call_vmapped(
-                lambda policy, prompt_token_ids, prompt_length: policy.with_prompt_token_counts(
-                    prompt_token_ids,
-                    prompt_length,
-                    self.decoder.vocab_size,
-                ),
-                sampling_policy,
-                prompt_token_ids,
-                prompt_lengths_without_padding,
-            )
-        if eos_token_ids is None:
-            eos_token_ids = jnp.asarray(self.config.generation_config.stop_token_ids, dtype=jnp.int32)
-
-        prefill_keychain, sampling_keychain, decoding_keychain = keychain.split(3)
-        prefill_results = self.prefill_tokens(
-            prompt_token_ids,
-            prompt_length + max_output_length + 1,
-            prompt_lengths_without_padding,
-            prefill_forward_pass_config,
-            keychain=prefill_keychain,
-        )
-        initial_state = DecodingState(
-            last_token_logits=prefill_results.last_token_logits,
-            last_token_indices=prefill_results.last_token_indices,
-            state=prefill_results.state,
-            stop_flags=jnp.zeros(batch_size, dtype=jnp.bool_),
-            sampling_policy=sampling_policy,
-        )
-
-        def sample_token(
-            logits: Float[Array, " vocabulary"],
-            sample_key: Key[Array, ""],
-        ) -> Int[Array, ""]:
-            return jax.random.categorical(sample_key, logits)
-
-        def loop_iteration(
-            state: DecodingState,
-            step_keys: tuple[Key[Array, " batch"], Key[Array, "..."]],
-        ) -> tuple[DecodingState, GenerationStepResults]:
-            sampling_keys, decoding_key = step_keys
-            processed_logits = call_vmapped(
-                lambda policy, logits: policy.process_logits(logits),
-                state.sampling_policy,
-                state.last_token_logits.astype(jnp.float32),
-            )
-            next_token_ids = call_vmapped(sample_token, processed_logits, sampling_keys)
-            next_token_ids = jnp.where(state.stop_flags, jnp.zeros(batch_size, dtype=jnp.int32), next_token_ids)
-            next_sampling_policy = call_vmapped(
-                lambda policy, token_id, should_count: policy.with_next_token_count(token_id, should_count),
-                state.sampling_policy,
-                next_token_ids,
-                jnp.logical_not(state.stop_flags),
-            )
-
-            if num_top_logits_to_return is None:
-                top_k_token_ids = None
-                top_k_token_logits = None
-            else:
-                top_k_token_logits, top_k_token_ids = jax.lax.top_k(processed_logits, num_top_logits_to_return)
-
-            next_token_indices = state.last_token_indices + 1
-            next_stop_flags = state.stop_flags | jnp.any(next_token_ids[:, None] == eos_token_ids[None, :], axis=-1)
-            decoder_result = self.decoder(
-                token_ids=next_token_ids[:, None],
-                token_positions=next_token_indices[:, None],
-                state=state.state,
-                return_updated_state=True,
-                forward_pass_config=decode_forward_pass_config,
-                keychain=Keychain(vmapped_keys=decoding_key, batch_key=decoding_keychain.batch_key),
-            )
-            assert decoder_result.updated_state is not None
-
-            return (
-                DecodingState(
-                    last_token_logits=decoder_result.logits[:, 0, :].astype(jnp.float32),
-                    last_token_indices=next_token_indices,
-                    state=decoder_result.updated_state,
-                    stop_flags=next_stop_flags,
-                    sampling_policy=next_sampling_policy,
-                ),
-                GenerationStepResults(
-                    token_ids=next_token_ids,
-                    top_k_token_ids=top_k_token_ids,
-                    top_k_token_logits=top_k_token_logits,
-                ),
-            )
-
-        sampling_keys = sampling_keychain.rolling_broadcast(
-            (max_output_length, batch_size),
-            mode=KeychainBroadcastMode.SUFFIX,
-        ).vmapped_keys
-        decoding_keys = decoding_keychain.rolling_broadcast(
-            (max_output_length, *decoding_keychain.vmapped_keys.shape),
-            mode=KeychainBroadcastMode.SUFFIX,
-        ).vmapped_keys
-        _, generated = jax.lax.scan(loop_iteration, initial_state, (sampling_keys, decoding_keys))
-
-        token_ids = rearrange(generated.token_ids, "step batch -> batch step")
-        if num_top_logits_to_return is None:
-            top_k_token_ids = None
-            top_k_token_logits = None
-        else:
-            top_k_token_ids = rearrange(generated.top_k_token_ids, "step batch k -> batch step k")
-            top_k_token_logits = rearrange(generated.top_k_token_logits, "step batch k -> batch step k")
 
         return GenerationResults(
             token_ids=token_ids,
