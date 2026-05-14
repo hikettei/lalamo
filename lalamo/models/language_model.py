@@ -23,7 +23,7 @@ from lalamo.modules import (
 from lalamo.modules.token_mixer import State
 from lalamo.modules.utils import call_vmapped
 from lalamo.sampling import SamplingPolicy
-from lalamo.speculator.common import NoSpeculator, Speculator, SpeculatorState
+from lalamo.speculator.common import NoSpeculator, Speculator
 from lalamo.speculator.proposal import AcceptedProposal
 from lalamo.speculator.state import LMState, MemoryBuffers, StateRequest
 
@@ -67,7 +67,6 @@ class DecodingState(NamedTuple):
 class GenerationState(NamedTuple):
     sampling_policy: SamplingPolicy
     lm_state: LMState
-    speculator_state: SpeculatorState
 
 
 class DecodingSetup(NamedTuple):
@@ -363,11 +362,6 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
         initial_state = GenerationState(
             sampling_policy=sampling_policy,
             lm_state=initial_lm_state,
-            speculator_state=active_speculator.init_state(
-                prompt_token_ids,
-                prompt_lengths_without_padding,
-                max_output_length,
-            ),
         )
 
         def output_lengths(lm_state: LMState) -> Int[Array, " batch"]:
@@ -392,7 +386,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             lm_state = state.lm_state
             current_output_lengths = output_lengths(lm_state)
             done = is_done(state)
-            proposal, draft_state = active_speculator.draft(lm_state, state.speculator_state)
+            proposal = active_speculator.draft(lm_state)
             proposal_inputs = proposal.forward_inputs(lm_state.next_token_position)
             forward_pass_config = decode_forward_pass_config
             if forward_pass_config is None:
@@ -454,12 +448,6 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
                 GenerationState(
                     sampling_policy=next_sampling_policy,
                     lm_state=next_lm_state,
-                    speculator_state=active_speculator.update_state(
-                        state.speculator_state,
-                        draft_state,
-                        accepted,
-                        write_mask,
-                    ),
                 ),
                 accepted,
             )

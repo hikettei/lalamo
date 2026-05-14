@@ -16,14 +16,7 @@ from typer import Option
 from lalamo.data.completion_features import FeatureRequest, LalamoCompletionFeatures
 from lalamo.data.lalamo_completions import LalamoCompletion
 from lalamo.modules.decoder import Decoder
-from lalamo.speculator.common import (
-    EmptySpeculatorDraftState,
-    Speculator,
-    SpeculatorBackend,
-    SpeculatorDraftState,
-    SpeculatorState,
-    write_speculator_artifact,
-)
+from lalamo.speculator.common import Speculator, SpeculatorBackend, write_speculator_artifact
 from lalamo.speculator.proposal import TrieProposal
 from lalamo.speculator.state import LMState, StateRequest
 from lalamo.speculator.training import (
@@ -356,12 +349,7 @@ class NGramSpeculator(Speculator):
     def state_request(self) -> StateRequest:
         return StateRequest(token_id_capacity=max(self.model.max_order - 1, 0))
 
-    def draft(
-        self,
-        state: LMState,
-        speculator_state: SpeculatorState,
-    ) -> tuple[TrieProposal, SpeculatorDraftState]:
-        del speculator_state
+    def draft(self, state: LMState) -> TrieProposal:
         proposal = state.create_root_proposal(budget=self.width * self.depth + 1)
         parent_indices = [0 for _ in range(state.root_bonus_id.shape[0])]
         contexts = self.contexts(state)
@@ -392,7 +380,7 @@ class NGramSpeculator(Speculator):
                         parent_indices[row_index] = node_index
                         contexts[row_index].append(token_id)
 
-        return proposal, EmptySpeculatorDraftState()
+        return proposal
 
     def contexts(self, state: LMState) -> list[list[int]]:
         root_bonus_ids = [int(token_id) for token_id in state.root_bonus_id.tolist()]

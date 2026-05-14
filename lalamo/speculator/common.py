@@ -4,28 +4,22 @@ from inspect import isabstract
 from pathlib import Path
 from typing import Any, ClassVar
 
-import equinox as eqx
 import msgpack
-from jaxtyping import Array, Bool, Int
 
 from lalamo.modules.decoder import Decoder
-from lalamo.speculator.proposal import AcceptedProposal, TrieProposal
+from lalamo.speculator.proposal import TrieProposal
 from lalamo.speculator.state import LMState, MemoryBuffers, RingBuffer, StateRequest
 from lalamo.utils.registry_abc import RegistryABC
 
 __all__ = [
     "ARTIFACT_HEADER",
     "BACKEND_ENTRY_POINT_GROUP",
-    "EmptySpeculatorDraftState",
-    "EmptySpeculatorState",
     "LMState",
     "MemoryBuffers",
     "NoSpeculator",
     "RingBuffer",
     "Speculator",
     "SpeculatorBackend",
-    "SpeculatorDraftState",
-    "SpeculatorState",
     "StateRequest",
     "get_speculator_backend",
     "load_speculator",
@@ -39,62 +33,18 @@ BACKEND_ENTRY_POINT_GROUP = "lalamo.speculator_backends"
 ARTIFACT_HEADER = "mirai.speculator"
 
 
-class SpeculatorState(eqx.Module):
-    pass
-
-
-class SpeculatorDraftState(eqx.Module):
-    pass
-
-
-class EmptySpeculatorState(SpeculatorState):
-    pass
-
-
-class EmptySpeculatorDraftState(SpeculatorDraftState):
-    pass
-
-
 class Speculator(ABC):
     @property
     def state_request(self) -> StateRequest:
         return StateRequest()
 
-    def init_state(
-        self,
-        prompt_token_ids: Int[Array, "batch prompt"],
-        prompt_lengths_without_padding: Int[Array, " batch"],
-        max_output_length: int,
-    ) -> SpeculatorState:
-        del prompt_token_ids, prompt_lengths_without_padding, max_output_length
-        return EmptySpeculatorState()
-
     @abstractmethod
-    def draft(
-        self,
-        state: LMState,
-        speculator_state: SpeculatorState,
-    ) -> tuple[TrieProposal, SpeculatorDraftState]: ...
-
-    def update_state(
-        self,
-        speculator_state: SpeculatorState,
-        draft_state: SpeculatorDraftState,
-        accepted: AcceptedProposal,
-        write_mask: Bool[Array, "batch max_slots"],
-    ) -> SpeculatorState:
-        del draft_state, accepted, write_mask
-        return speculator_state
+    def draft(self, state: LMState) -> TrieProposal: ...
 
 
 class NoSpeculator(Speculator):
-    def draft(
-        self,
-        state: LMState,
-        speculator_state: SpeculatorState,
-    ) -> tuple[TrieProposal, SpeculatorDraftState]:
-        del speculator_state
-        return state.create_root_proposal(budget=1), EmptySpeculatorDraftState()
+    def draft(self, state: LMState) -> TrieProposal:
+        return state.create_root_proposal(budget=1)
 
 
 class SpeculatorBackend[ConfigT](RegistryABC):

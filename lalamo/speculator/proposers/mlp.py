@@ -16,14 +16,7 @@ from typer import Option
 from lalamo.data.completion_features import FeatureRequest, LalamoCompletionFeatures
 from lalamo.data.lalamo_completions import LalamoCompletion
 from lalamo.modules.decoder import Decoder
-from lalamo.speculator.common import (
-    EmptySpeculatorDraftState,
-    Speculator,
-    SpeculatorBackend,
-    SpeculatorDraftState,
-    SpeculatorState,
-    write_speculator_artifact,
-)
+from lalamo.speculator.common import Speculator, SpeculatorBackend, write_speculator_artifact
 from lalamo.speculator.proposal import TrieProposal
 from lalamo.speculator.state import LMState, StateRequest
 from lalamo.speculator.training import (
@@ -118,12 +111,7 @@ class MLPSpeculator(Speculator):
     def state_request(self) -> StateRequest:
         return StateRequest(output_norm_capacity=1)
 
-    def draft(
-        self,
-        state: LMState,
-        speculator_state: SpeculatorState,
-    ) -> tuple[TrieProposal, SpeculatorDraftState]:
-        del speculator_state
+    def draft(self, state: LMState) -> TrieProposal:
         output_norm, _ = state.recent_output_norm(1)
         logits = self.model(output_norm[:, -1])
         width = min(self.width, logits.shape[-1])
@@ -144,7 +132,7 @@ class MLPSpeculator(Speculator):
                     next_parent_indices = jnp.full(parent_indices.shape, node_index, dtype=jnp.int32)
             parent_indices = next_parent_indices
 
-        return proposal, EmptySpeculatorDraftState()
+        return proposal
 
 
 @dataclass(frozen=True)

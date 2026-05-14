@@ -849,15 +849,7 @@ class ContinuousBatchScheduler(BatchScheduler):
         keychain: Keychain | None = None,
     ) -> Iterator[tuple[int, GeneratedSequence]]:
         if speculator is not None:
-            yield from FixedSizeBatchScheduler(model=self.model).generate_tokens_many(
-                tokenized,
-                generation_config=generation_config,
-                batch_scheduler_config=batch_scheduler_config,
-                fast_peak_memory=fast_peak_memory,
-                speculator=speculator,
-                keychain=keychain,
-            )
-            return
+            raise NotImplementedError("ContinuousBatchScheduler does not support speculative decoding yet.")
         if batch_scheduler_config.num_top_logits_to_return is not None:
             raise RuntimeError("num_top_logits_to_return is not supported with ContinuousBatchScheduler.")
 
