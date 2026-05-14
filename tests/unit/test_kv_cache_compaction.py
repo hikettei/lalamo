@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 
-from lalamo.modules.token_mixers.state import State, StaticKVCacheLayer
-from lalamo.modules.token_mixers.state.kv_cache import compact_state_layers
+from lalamo.modules.token_mixer import State
+from lalamo.modules.token_mixers.kv_cache import StaticKVCacheLayer, compact_state_layers
 
 
 def test_static_kv_cache_compact_moves_accepted_draft_slots() -> None:
@@ -33,7 +33,7 @@ def test_static_kv_cache_compact_moves_accepted_draft_slots() -> None:
         jnp.array([[100, 101, 104, 102, 104, 105]], dtype=jnp.float32),
     )
     assert jnp.array_equal(compacted_layer.current_length, jnp.array([4], dtype=jnp.int32))
-    assert compacted_layer.prefix_length_for_sample(0) == 4
+    assert compacted_layer.current_length[0] == 4
 
 
 def test_static_kv_cache_compact_matches_rowwise_scalar_compaction() -> None:

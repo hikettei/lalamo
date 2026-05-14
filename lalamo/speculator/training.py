@@ -3,15 +3,15 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from itertools import batched
 from typing import Annotated
 
 import jax
 from annotated_types import Ge
 
-from lalamo.data.completion_features import FeatureRequest, LalamoCompletionFeatures  # noqa: TC001
-from lalamo.data.lalamo_completions import LalamoCompletion  # noqa: TC001
+from lalamo.data.completion_features import FeatureRequest, LalamoCompletionFeatures
+from lalamo.data.lalamo_completions import LalamoCompletion
 from lalamo.models.completion_feature_extractor import FeatureQueue, OnlineCompletionFeatureExtractor, jax_device
 from lalamo.speculator.common import Speculator
 
@@ -80,7 +80,7 @@ class SpeculatorTrainingProgress:
         )
 
 
-class SpeculatorTrainingPhase(str, Enum):
+class SpeculatorTrainingPhase(StrEnum):
     TRAIN = "train"
     EVAL = "eval"
 
@@ -190,7 +190,7 @@ def train_speculator[SpeculatorT: Speculator, StateT](
     eval_sequences = count_completions(eval_completions) if eval_completions is not None else 0
     schedule = SpeculatorTrainingSchedule.create(config, train_sequences, eval_sequences)
     progress = SpeculatorTrainingProgress.create()
-    last_event: SpeculatorTrainingEvent | None = SpeculatorTrainingEvent(
+    initial_event = SpeculatorTrainingEvent(
         epoch=1,
         progress=progress,
         phase=SpeculatorTrainingPhase.TRAIN,
@@ -201,8 +201,9 @@ def train_speculator[SpeculatorT: Speculator, StateT](
         total_batches=schedule.total_batches,
     )
     if progress_callback is not None:
-        progress_callback(last_event)
+        progress_callback(initial_event)
 
+    last_event: SpeculatorTrainingEvent | None = initial_event
     training_device = jax_device(training_device_id)
     with jax.default_device(training_device):
         state = trainer.init_state()

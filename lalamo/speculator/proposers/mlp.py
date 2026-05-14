@@ -14,8 +14,8 @@ from jaxtyping import Array, Float, PRNGKeyArray  # noqa: TC002
 from typer import Option
 
 from lalamo.data.completion_features import FeatureRequest, LalamoCompletionFeatures
-from lalamo.data.lalamo_completions import LalamoCompletion  # noqa: TC001
-from lalamo.modules.decoder import Decoder  # noqa: TC001
+from lalamo.data.lalamo_completions import LalamoCompletion
+from lalamo.modules.decoder import Decoder
 from lalamo.speculator.common import (
     EmptySpeculatorDraftState,
     Speculator,
@@ -24,7 +24,7 @@ from lalamo.speculator.common import (
     SpeculatorState,
     write_speculator_artifact,
 )
-from lalamo.speculator.proposal import TrieProposal  # noqa: TC001
+from lalamo.speculator.proposal import TrieProposal
 from lalamo.speculator.state import LMState, StateRequest
 from lalamo.speculator.training import (
     SpeculatorBatchResult,
@@ -133,6 +133,7 @@ class MLPSpeculator(Speculator):
         parent_indices = jnp.zeros((state.root_bonus_id.shape[0],), dtype=jnp.int32)
 
         for depth_index in range(self.model.depth):
+            next_parent_indices = parent_indices
             for rank in range(width):
                 proposal, node_index = proposal.add_nodes(
                     batch_indices=batch_indices,
@@ -196,7 +197,7 @@ class MLPTrainer(SpeculatorTrainer[MLPSpeculator, MLPTrainingState]):
         del context
         model, optimizer_state = self.init_model_and_optimizer(state, features)
         (loss, loss_weight), grads = eqx.filter_value_and_grad(mlp_loss, has_aux=True)(model, features)
-        updates, optimizer_state = self.optimizer.update(grads, optimizer_state, model)
+        updates, optimizer_state = self.optimizer.update(grads, optimizer_state, eqx.filter(model, eqx.is_array))
         model = eqx.apply_updates(model, updates)
         return (
             MLPTrainingState(

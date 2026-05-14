@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Bool, Int
 
-from lalamo.message_processor import Message, UserMessage
+from lalamo.models.chat_codec import Message, UserMessage
 
 
 def is_non_empty_user_message(message: Message) -> bool:
@@ -12,9 +12,10 @@ def is_non_empty_user_message(message: Message) -> bool:
         return False
 
     content = message.content
+    if content is None:
+        return False
     if isinstance(content, str):
         return bool(content.strip())
-
     return any(isinstance(block, str) and bool(block.strip()) for block in content)
 
 

@@ -1,16 +1,14 @@
 import re
 import shutil
 import sys
-from collections.abc import Callable, Iterable
 from contextlib import ExitStack
-from dataclasses import MISSING, dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from importlib.util import find_spec
-from inspect import Parameter, Signature
-from itertools import islice
 from pathlib import Path
-from typing import Annotated, get_type_hints
+from typing import Annotated
 
+import jax
 import jax.profiler
 import requests
 import soundfile as sf
@@ -19,64 +17,35 @@ from click import Parameter as ClickParameter
 from click import ParamType
 from rich import box
 from rich.console import Console
-from rich.live import Live
 from rich.panel import Panel
 from rich.progress import (
-    MofNCompleteColumn,
     Progress,
     SpinnerColumn,
     TaskID,
     TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
 )
 from rich.prompt import Confirm
 from rich.table import Table
-from typer import Argument, Context, Exit, Option, Typer
+from typer import Argument, Exit, Option, Typer
 
 from lalamo.audio.utils import play_mono_audio
 from lalamo.commands import (
-    CollectTracesCallbacks,
-    CollectTracesEvent,
     ConversionCallbacks,
-    EstimateBatchsizeCallbacks,
-    EvalDatasetName,
-    GenerateRepliesCallbacks,
-    Precision,
+    DType,
     PullCallbacks,
-    TraceCallbacks,
-    TrainCallbacks,
     _suggest_similar_models,
 )
-from lalamo.commands import collect_traces as _collect_traces
 from lalamo.commands import convert as _convert
-from lalamo.commands import estimate_batchsize as _estimate_batchsize
-from lalamo.commands import evaluate_speculator as _evaluate_speculator
-from lalamo.commands import generate_replies as _generate_replies
 from lalamo.commands import pull as _pull
-from lalamo.commands import trace as _trace
-from lalamo.commands import train as _train
-from lalamo.common import (
-    get_default_device_bytes,
-    get_usable_memory_from_bytes,
-)
-from lalamo.data.lalamo_completions import iter_completions
-from lalamo.message_processor import UserMessage
 from lalamo.model_import import ModelSpec
 from lalamo.model_import.common import FileSpec
 from lalamo.model_import.remote_registry import RegistryModel, RegistryModelFile, fetch_available_models
 from lalamo.model_registry import ModelRegistry
-from lalamo.models import ClassifierModelConfig, LanguageModelConfig
-from lalamo.models.common import BatchSizesComputedEvent
-from lalamo.models.tts_model import TTSGenerator, TTSMessage
-from lalamo.speculator.common import (
-    ARTIFACT_HEADER,
-    SpeculatorBackend,
-    load_speculator,
-    read_speculator_artifact,
-    speculator_backends,
-)
-from lalamo.speculator.training import SpeculatorTrainingConfig, SpeculatorTrainingEvent
+from lalamo.models import LanguageModel, TTSModel
+from lalamo.models.chat_codec import Message, UserMessage
+from lalamo.models.tts_codec import TTSMessage
+from lalamo.module import Keychain
+from lalamo.utils.memory import get_available_bytes_on_default_device
 
 SCRIPT_NAME = Path(sys.argv[0]).name
 
@@ -143,7 +112,7 @@ def chat(
     message: Annotated[
         str | None,
         Option(
-            help="Message for non-interactive mode",
+            help="Message for non-interactive mode.",
             show_default="None, run interactively",
         ),
     ] = None,
@@ -153,14 +122,6 @@ def chat(
             help="Maximum number of tokens to generate per reply.",
         ),
     ] = 8192,
-    speculator_path: Annotated[
-        Path | None,
-        Option(
-            "--speculator",
-            help="Path to a speculator artifact file.",
-            show_default="none",
-        ),
-    ] = None,
 ) -> None:
     with Progress(
         SpinnerColumn(),
@@ -169,69 +130,51 @@ def chat(
         transient=True,
     ) as progress:
         loading_task = progress.add_task("🚀 [cyan]Loading model...[/cyan]")
-        model = LanguageModelConfig.load_model(model_path)
-        speculator = load_speculator(speculator_path, model.model) if speculator_path is not None else None
+        model = LanguageModel.load(model_path)
         progress.remove_task(loading_task)
         warmup_task = progress.add_task("🔥 Warming up compilation cache...")
-        list(model.stream_reply_text([UserMessage("")], max_output_length=1, speculator=speculator))
+        warmup_tokens = iter(
+            model.stream_reply_text(
+                [UserMessage("")],
+                max_output_length=max_tokens,
+                keychain=Keychain.init(0),
+            ),
+        )
+        for _ in range(2):
+            try:
+                next(warmup_tokens)
+            except StopIteration:
+                break
         progress.remove_task(warmup_task)
 
     if message is None:
         console.print(f"🤖 Chatting with [blue]{model_path}[/blue]:")
-
-        messages = []
+        messages: list[Message] = []
+        turn_index = 0
         while True:
             user_text = console.input("[cyan]user> [/cyan]")
-            user_message = UserMessage(user_text)
-            messages.append(user_message)
+            messages.append(UserMessage(user_text))
 
             console.print("[red]assistant> [/red]", end="")
-            model_response_tokens = []
-            for token in model.stream_reply_text(messages, max_output_length=max_tokens, speculator=speculator):
+            response_text_parts = []
+            for token in model.stream_reply_text(
+                messages,
+                max_output_length=max_tokens,
+                keychain=Keychain.init(turn_index + 1),
+            ):
                 console.print(token, end="")
-                model_response_tokens.append(token)
+                response_text_parts.append(token)
             console.print()
-            model_response_text = "".join(model_response_tokens)
-            messages.append(model.message_processor.parse_response(model_response_text))
-    else:
-        for token in model.stream_reply_text(
-            [UserMessage(message)], max_output_length=max_tokens, speculator=speculator
-        ):
-            console.print(token, end="")
-        console.print()
+            messages.append(model.token_codec.parse_response("".join(response_text_parts)))
+            turn_index += 1
 
-
-@app.command(help="Classify given message with a Classifier type of model.")
-def classify(
-    model_path: Annotated[
-        Path,
-        Argument(
-            help="Path to the model directory.",
-            metavar="MODEL_PATH",
-        ),
-    ],
-) -> None:
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        transient=True,
-    ) as progress:
-        loading_task = progress.add_task("🚀 [cyan]Loading model...[/cyan]")
-        model = ClassifierModelConfig.load_model(model_path)
-        progress.remove_task(loading_task)
-        warmup_task = progress.add_task("🔥 Warming up...")
-        model.classify_chat([UserMessage(content="warmup message")])
-        progress.remove_task(warmup_task)
-    console.print(f"🤖 Classifying input with [blue]{model_path}[/blue]:")
-    while True:
-        user_text = console.input("[cyan]user> [/cyan]")
-        user_message = UserMessage(user_text)
-
-        console.print("[red]assistant> [/red]", end="")
-        result = model.classify_chat([user_message])
-        for label, confidence in result.items():
-            console.print(f"{label} : {confidence}", end="")
-        console.print()
+    for token in model.stream_reply_text(
+        [UserMessage(message)],
+        max_output_length=max_tokens,
+        keychain=Keychain.init(1),
+    ):
+        console.print(token, end="")
+    console.print()
 
 
 @dataclass
@@ -248,9 +191,9 @@ class CliConversionCallbacks(ConversionCallbacks):
         conversion_strs = [
             f"🚀 Converting [cyan]{self.model_spec.name}[/cyan] by [cyan]{self.model_spec.vendor}[/cyan]",
         ]
-        if self.precision is not None:
+        if self.dtype is not None:
             conversion_strs.append(
-                f" and converting floating-point weights into [cyan]{self.precision.name.lower()}[/cyan] precision",
+                f" and loading floating-point weights as [cyan]{self.dtype.name.lower()}[/cyan]",
             )
         conversion_strs.append(".")
         console.print("".join(conversion_strs))
@@ -350,7 +293,7 @@ class CliPullCallbacks(PullCallbacks):
         console.print(f"🎉 Model successfully pulled to [cyan]{self.output_dir}[/cyan]!")
 
 
-@app.command(help="Synthesize speech from given text utterance")
+@app.command(help="Synthesize speech from given text utterance.")
 def tts(
     model_path: Annotated[
         Path,
@@ -359,11 +302,24 @@ def tts(
             metavar="MODEL_PATH",
         ),
     ],
-    output_file: Annotated[Path | None, Argument(help="Path to output WAV file with synthesized speech")] = None,
+    output_file: Annotated[Path | None, Argument(help="Path to output WAV file with synthesized speech.")] = None,
     replay: Annotated[
         bool,
         Option(
             help="Render synthesized speech into default audio interface.",
+        ),
+    ] = False,
+    message: Annotated[
+        str | None,
+        Option(
+            help="Message for non-interactive mode.",
+            show_default="None, run interactively",
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        Option(
+            help="Overwrite existing output file without prompting. Always enabled with --message.",
         ),
     ] = False,
 ) -> None:
@@ -371,50 +327,56 @@ def tts(
         output_file = Path.cwd() / "generated_speech.wav"
         console.print(f"Will save output to file {output_file}")
 
-    if replay and not find_spec("pyaudio"):
+    if replay and find_spec("pyaudio") is None:
         err_console.print("Failed to import pyaudio package used for audio replay. Run Lalamo without --replay.")
         raise Exit(1)
 
     console.print(f"🤖 Loading model from specified path: {model_path}.")
-    model = TTSGenerator.load_model(model_path)
+    model = TTSModel.load(model_path)
 
-    assert model is not None
-    _stop_word = "/stop"
+    keychain = Keychain.init(0)
+    messages = [message] if message is not None else None
+    overwrite_existing_output = overwrite or message is not None
     while True:
-        user_text = console.input(f"[cyan]input text to generate speech({_stop_word} to exit)> [/cyan]")
-        if user_text == _stop_word:
-            console.print("[green] Goodbye! [/green]")
-            break
+        if messages is not None:
+            try:
+                user_text = messages.pop(0)
+            except IndexError:
+                break
+        else:
+            user_text = console.input("[cyan]input text to generate speech> [/cyan]")
         if user_text == "":
             continue
 
         user_message = TTSMessage(content=user_text, speaker_id="speaker:0", style="interleave")
-
-        tts_result = model.generate_speech([user_message])
+        keychain, generation_keychain = keychain.split()
+        tts_result = model.generate_speech([user_message], keychain=generation_keychain)
 
         if replay:
             play_mono_audio(tts_result.audio, tts_result.audio_params.samplerate)
 
         if output_file.exists():
-            answer = console.input(
-                rf"⚠️ Output file [cyan]{output_file}[/cyan] already exists."
-                r" Do you want to overwrite it? [cyan]\[y/n][/cyan]: ",
-            )
-            while answer.lower() not in ["y", "n", "yes", "no"]:
-                answer = console.input("Please enter 'y' or 'n': ")
-            if answer.lower() in ["y", "yes"]:
-                Path.unlink(output_file)
+            if overwrite_existing_output:
+                output_file.unlink()
             else:
-                console.print("Continue without saving the result")
-                continue
+                answer = console.input(
+                    rf"⚠️ Output file [cyan]{output_file}[/cyan] already exists."
+                    r" Do you want to overwrite it? [cyan]\[y/n][/cyan]: ",
+                )
+                while answer.lower() not in ["y", "n", "yes", "no"]:
+                    answer = console.input("Please enter 'y' or 'n': ")
+                if answer.lower() in ["y", "yes"]:
+                    output_file.unlink()
+                else:
+                    console.print("Continue without saving the result")
+                    continue
 
         sf.write(str(output_file), tts_result.audio, tts_result.audio_params.samplerate)
         console.print(f"[green] ... saved generated audio to {output_file}[/green]")
-
         console.print()
 
 
-@app.command(help="Convert the model for use with the Uzu inference engine.")
+@app.command(help="Import and export a model into the local Lalamo format.")
 def convert(
     model_repo: Annotated[
         ModelSpec,
@@ -430,11 +392,11 @@ def convert(
             autocompletion=lambda: list(ModelRegistry.build().repo_to_model),
         ),
     ],
-    precision: Annotated[
-        Precision | None,
+    dtype: Annotated[
+        DType | None,
         Option(
-            help="Precision to use for activations and non-quantized weights.",
-            show_default="Native precision of the model",
+            help="Dtype to use for activations and non-quantized weights.",
+            show_default="Native dtype of the model",
         ),
     ] = None,
     output_dir: Annotated[
@@ -464,7 +426,7 @@ def convert(
     _convert(
         model_repo,
         output_dir,
-        precision,
+        dtype,
         context_length,
         partial(CliConversionCallbacks, overwrite=overwrite),
     )
@@ -509,114 +471,6 @@ def pull(
     )
 
 
-@dataclass
-class CliTraceCallbacks(TraceCallbacks):
-    overwrite: bool = False
-
-    stack: ExitStack = field(default_factory=ExitStack)
-    progress: Progress | None = None
-    loading_task: TaskID | None = None
-    tracing_task: TaskID | None = None
-    saving_task: TaskID | None = None
-
-    def output_exists(self) -> None:
-        if not self.overwrite and not Confirm().ask(
-            rf"⚠️ Output [cyan]{self.output_path}[/cyan] already exists."
-            r" Do you want to overwrite it?",
-        ):
-            raise Exit
-
-        self.output_path.unlink()
-
-    def started(self) -> None:
-        console.print(f"🔍 Tracing [cyan]{self.model_path}[/cyan]")
-
-        self.progress = self.stack.enter_context(
-            Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                transient=True,
-            ),
-        )
-
-    def loading_model(self) -> None:
-        assert self.progress is not None
-
-        self.loading_task = self.progress.add_task("🧠 Loading model...")
-
-    def finished_loading_model(self) -> None:
-        assert self.progress is not None
-        assert self.loading_task is not None
-
-        self.progress.remove_task(self.loading_task)
-
-    def tracing_model(self) -> None:
-        assert self.progress is not None
-
-        self.tracing_task = self.progress.add_task("🔍 Recording trace...")
-
-    def finished_tracing_model(self) -> None:
-        assert self.progress is not None
-        assert self.tracing_task is not None
-
-        self.progress.remove_task(self.tracing_task)
-
-    def saving_trace(self) -> None:
-        assert self.progress is not None
-
-        self.saving_task = self.progress.add_task(f"💾 Saving trace to {self.output_path}")
-
-    def finished_saving_trace(self) -> None:
-        assert self.progress is not None
-        assert self.saving_task is not None
-
-        self.progress.remove_task(self.saving_task)
-        self.stack.close()
-        console.print(f"💾 Trace saved to [cyan]{self.output_path}[/cyan]")
-
-
-@app.command(help="Trace a model.")
-def trace(
-    model_path: Annotated[
-        Path,
-        Argument(
-            help="Path to the model directory.",
-            metavar="MODEL_PATH",
-        ),
-    ],
-    output_path: Annotated[
-        Path | None,
-        Option(
-            help="Path to save the trace to.",
-            show_default="${MODEL_PATH}/traces.safetensors",
-        ),
-    ] = None,
-    overwrite: Annotated[
-        bool,
-        Option(
-            help="Overwrite existing trace file.",
-        ),
-    ] = False,
-    message: Annotated[
-        str | None,
-        Option(
-            help="Text message to use as prompt when recording trace",
-        ),
-    ] = None,
-) -> None:
-    if output_path is None:
-        output_path = model_path / "traces.safetensors"
-
-    messages = None if message is None else [UserMessage(content=message)]
-
-    _trace(
-        model_path,
-        output_path,
-        messages,
-        partial(CliTraceCallbacks, overwrite=overwrite),
-    )
-
-
 def _model_size_string_to_int(
     size_str: str,
     _regex: re.Pattern = re.compile(r"(?P<number>(\d+)(\.\d*)?)(?P<suffix>[KMBT])"),
@@ -655,7 +509,7 @@ def list_models(
 
     if plain:
         for spec in sorted_specs:
-            console.print(spec.repo)
+            console.print(spec.origin.description)
         return
 
     table = Table(
@@ -667,171 +521,15 @@ def list_models(
     table.add_column("Vendor", justify="left", style="magenta")
     table.add_column("Family", justify="left", style="magenta", no_wrap=True)
     table.add_column("Size", justify="right", style="magenta")
-    table.add_column("Quant", justify="left", style="magenta")
-    table.add_column("Repo", justify="left", style="cyan", no_wrap=True)
+    table.add_column("Origin", justify="left", style="cyan", no_wrap=True)
     for spec in sorted_specs:
         table.add_row(
             spec.vendor,
             spec.family,
             spec.size,
-            str(spec.quantization),
-            spec.repo,
+            spec.origin.description,
         )
     console.print(table)
-
-
-@dataclass
-class CliGenerateRepliesCallbacks(GenerateRepliesCallbacks):
-    stack: ExitStack = field(default_factory=ExitStack)
-    progress: Progress | None = None
-    loading_task: TaskID | None = None
-    estimating_task: TaskID | None = None
-    generation_task: TaskID | None = None
-
-    def loading_model(self) -> None:
-        self.progress = self.stack.enter_context(
-            Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                transient=True,
-            ),
-        )
-        self.loading_task = self.progress.add_task("🧠 [cyan]Loading model...[/cyan]", total=None)
-
-    def finished_loading_model(self) -> None:
-        assert self.progress is not None
-        assert self.loading_task is not None
-        self.progress.remove_task(self.loading_task)
-
-    def loading_dataset(self) -> None:
-        assert self.progress is not None
-        self.loading_task = self.progress.add_task("🗂️ [cyan]Loading dataset...[/cyan]", total=None)
-
-    def finished_loading_dataset(self) -> None:
-        assert self.progress is not None
-        assert self.loading_task is not None
-        self.progress.remove_task(self.loading_task)
-
-    def estimating_batchsize(self, sequence_length: int, lo: int, hi: int | None) -> None:
-        assert self.progress is not None
-        hi_str = str(hi) if hi is not None else "?"
-        description = (
-            f"📐 [cyan]Computing batch size for the prompt length of {sequence_length}... ({lo}..{hi_str})[/cyan]"
-        )
-        if self.estimating_task is None:
-            self.estimating_task = self.progress.add_task(description)
-        else:
-            self.progress.update(self.estimating_task, description=description)
-
-    def batch_sizes_estimated(self) -> None:
-        assert self.progress is not None
-        if self.estimating_task is None:
-            self.estimating_task = self.progress.add_task(
-                "📐 [cyan]Estimating the best batch sizes...[/cyan]",
-                total=None,
-            )
-
-    def batch_sizes_computed(self, event: BatchSizesComputedEvent) -> None:
-        assert self.progress is not None
-        if self.estimating_task is not None:
-            self.progress.remove_task(self.estimating_task)
-            self.estimating_task = None
-        output_console = self.progress.console if self.progress is not None else console
-        for info in event.batch_sizes:
-            output_console.print(
-                f"Prefix length {info.prefix_length} has {info.num_elements} elements, "
-                f"with batchsize of {info.batch_size}",
-            )
-        self.generation_task = self.progress.add_task(
-            "🔮 [cyan]Generating replies...[/cyan]",
-            total=self.total_rows,
-        )
-
-    def generation_progress(self, rows_processed: int) -> None:
-        assert self.progress is not None
-        assert self.generation_task is not None
-        self.progress.update(self.generation_task, completed=rows_processed + 1)
-
-    def finished_generation(self) -> None:
-        assert self.progress is not None
-        assert self.generation_task is not None
-        self.progress.update(self.generation_task, description="✅ Completed")
-        self.stack.close()
-        console.print(f"💾 Replies saved to [cyan]{self.output_path}[/cyan]")
-
-
-@app.command(help="Generate replies for conversations in a parquet file.")
-def generate_replies(
-    model_path: Annotated[
-        Path,
-        Argument(
-            help="Path to the model directory.",
-            metavar="MODEL_PATH",
-        ),
-    ],
-    dataset_path: Annotated[
-        Path,
-        Argument(
-            help="Path to the input parquet file with conversations.",
-            metavar="DATASET_PATH",
-        ),
-    ],
-    output_path: Annotated[
-        Path,
-        Option(
-            help="Path to save the output parquet file.",
-        ),
-    ],
-    vram_gb: Annotated[
-        int | None,
-        Option(
-            help="Maximum VRAM in GB. Batch sizes are estimated automatically.",
-            show_default="max on default device",
-        ),
-    ] = None,
-    max_output_length: Annotated[
-        int,
-        Option(help="Maximum number of tokens to generate per reply."),
-    ] = 8192,
-    batch_size: Annotated[
-        int | None,
-        Option(help="Fixed batch size to use, skipping automatic estimation."),
-    ] = None,
-    speculator_path: Annotated[
-        Path | None,
-        Option(
-            "--speculator",
-            help="Path to a speculator artifact file.",
-            show_default="none",
-        ),
-    ] = None,
-) -> None:
-    if batch_size is not None and vram_gb is not None:
-        err_console.print("Cannot use both --batch-size and --vram-gb")
-        raise Exit(1)
-
-    max_vram: int | None = None
-    if batch_size is None:
-        if vram_gb is not None:
-            mem_bytes = vram_gb * 1000 * 1000 * 1000
-        elif (mem_bytes := get_default_device_bytes()) is None:
-            err_console.print("Cannot get the default device's memory stats, use --vram-gb or --batch-size")
-            raise Exit(1)
-
-        max_vram = mem_bytes
-
-    _generate_replies(
-        model_path=model_path,
-        dataset_path=dataset_path,
-        output_path=output_path,
-        max_vram=max_vram,
-        max_output_length=max_output_length,
-        batch_size=batch_size,
-        speculator_path=speculator_path,
-        callbacks_type=CliGenerateRepliesCallbacks,
-    )
 
 
 @app.command(help="Start a server for batched inference.")
@@ -845,7 +543,7 @@ def server(
         Option(help="Port to bind to."),
     ] = 8293,
     vram_gb: Annotated[
-        int | None,
+        float | None,
         Option(
             help="Maximum VRAM in GB. Batch sizes are estimated automatically.",
             show_default="max on default device",
@@ -860,14 +558,14 @@ def server(
     ] = None,
 ) -> None:
     try:
-        from lalamo.server import start_server
+        from lalamo.server import start_server  # noqa: PLC0415
     except ImportError as error:
         err_console.print("Server extras not installed. Install with: uv add 'lalamo[server]'")
         raise Exit(1) from error
 
     if vram_gb is not None:
-        vram_bytes = vram_gb * 1000 * 1000 * 1000
-    elif (vram_bytes := get_default_device_bytes()) is None:
+        vram_bytes = int(vram_gb * 1000 * 1000 * 1000)
+    elif (vram_bytes := get_available_bytes_on_default_device()) is None:
         err_console.print("Cannot get the default device's memory stats, use --vram-gb")
         raise Exit(1)
 
@@ -877,699 +575,9 @@ def server(
     start_server(host=host, port=port, vram_bytes=vram_bytes, cache_dir=cache_dir)
 
 
-speculator_app = Typer()
-speculator_train_app = Typer(no_args_is_help=True)
-app.add_typer(speculator_app, name="speculator", help="Train a speculator for a model.")
-speculator_app.add_typer(speculator_train_app, name="train", help="Train a registered speculator backend.")
-
-
-@dataclass
-class CliEstimateBatchsizeCallbacks(EstimateBatchsizeCallbacks):
-    stack: ExitStack = field(default_factory=ExitStack)
-    loading_task: TaskID | None = None
-    estimating_task: TaskID | None = None
-
-    def loading_model(self) -> None:
-        self.progress = self.stack.enter_context(
-            Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                transient=True,
-            ),
-        )
-        self.loading_task = self.progress.add_task("[cyan]Loading model...[/cyan]")
-
-    def finished_loading_model(self) -> None:
-        assert self.loading_task is not None
-        self.progress.remove_task(self.loading_task)
-
-    def estimating_batchsize(self, lo: int, hi: int | None) -> None:
-        hi_str = str(hi) if hi is not None else "?"
-        description = f"[cyan]Estimating batch size... ({lo}..{hi_str})[/cyan]"
-        if self.estimating_task is None:
-            self.estimating_task = self.progress.add_task(description)
-        else:
-            self.progress.update(self.estimating_task, description=description)
-
-    def finished_estimating_batchsize(self, batchsize: int) -> None:
-        if self.estimating_task is not None:
-            self.progress.remove_task(self.estimating_task)
-        self.stack.close()
-        console.print(f"Found maximum batch size: [cyan]{batchsize}[/cyan]")
-
-
-@speculator_app.command(help="Estimate maximum batch size at which a model can be run.")
-def estimate_batchsize(
-    model_path: Annotated[
-        Path,
-        Argument(
-            help="Path to the model directory",
-            metavar="MODEL_PATH",
-        ),
-    ],
-    max_input_length: Annotated[
-        int,
-        Option(help="Max input length of a model."),
-    ] = 1024,
-    max_output_length: Annotated[
-        int,
-        Option(help="Max output length of a model."),
-    ] = 1024,
-    vram_gb: Annotated[
-        int | None,
-        Option(
-            help="Maximum vram size in GB allowed.",
-            show_default="max on default device",
-        ),
-    ] = None,
-) -> None:
-    if vram_gb is not None:
-        # H100 is 80gib (not gb!) card; it has around 85gb total
-        mem_bytes = vram_gb * 1000 * 1000 * 1000
-    elif (mem_bytes := get_default_device_bytes()) is None:
-        err_console.print("Cannot get the default device's memory stats, use --vram-gb")
-        raise Exit(1)
-
-    usable_mem = get_usable_memory_from_bytes(mem_bytes)
-
-    callbacks_type = CliEstimateBatchsizeCallbacks
-
-    _estimate_batchsize(
-        model_path,
-        usable_mem,
-        max_input_length,
-        max_output_length,
-        callbacks_type,
-    )
-
-
-@dataclass
-class CliCollectTracesCallbacks(CollectTracesCallbacks):
-    stack: ExitStack = field(default_factory=ExitStack)
-    live: Live | None = None
-    loading_task: TaskID | None = None
-    inference_task: TaskID | None = None
-
-    def loading_model(self) -> None:
-        self.live = self.stack.enter_context(Live(refresh_per_second=10))
-        self.progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            transient=True,
-        )
-        self.live.update(self.progress, refresh=True)
-        self.loading_task = self.progress.add_task("🧠 [cyan]Loading model...[/cyan]")
-
-    def finished_loading_model(self) -> None:
-        assert self.loading_task is not None
-        self.progress.remove_task(self.loading_task)
-
-    def loading_dataset(self) -> None:
-        self.loading_task = self.progress.add_task("🗂️ [cyan]Loading dataset...[/cyan]")
-
-    def finished_loading_dataset(self) -> None:
-        assert self.loading_task is not None
-        assert self.live is not None
-        self.progress.remove_task(self.loading_task)
-        self.progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-        )
-        self.live.update(self.progress, refresh=True)
-        self.inference_task = self.progress.add_task(
-            "🔮 [cyan]Running inference...[/cyan]",
-            total=None,
-        )
-
-    def inference_progress(self, event: CollectTracesEvent) -> None:
-        assert self.inference_task is not None
-        self.progress.update(
-            self.inference_task,
-            completed=event.sequences_processed,
-            total=event.total_sequences,
-        )
-
-    def finished_inference(self) -> None:
-        assert self.inference_task is not None
-        self.progress.update(self.inference_task, description="✅ Completed")
-        self.stack.close()
-
-
-@speculator_app.command(help="Run model inference and collect traces for speculator training")
-def collect_traces(
-    model_path: Annotated[
-        Path,
-        Argument(
-            help="Path to the model directory",
-            metavar="MODEL_PATH",
-        ),
-    ],
-    dataset_path: Annotated[
-        Path,
-        Argument(
-            help="Path to the dataset with prompts",
-            metavar="DATASET_PATH",
-        ),
-    ],
-    output_path: Annotated[
-        Path,
-        Option(
-            help="File to save traces to",
-            metavar="OUTPUT_PATH",
-        ),
-    ],
-    max_input_length: Annotated[
-        int,
-        Option(help="Filter prompts that have more than this number of tokens in context"),
-    ] = 4096,
-    max_output_length: Annotated[
-        int,
-        Option(help="Maximum number of tokens to generate in one completion"),
-    ] = 4096,
-    batch_size: Annotated[
-        int,
-        Option(help="Number of sequences in one batch"),
-    ] = 1,
-    num_tokens_to_generate: Annotated[
-        int | None,
-        Option(
-            help="Exit early after generating this number of output tokens",
-            show_default="all",
-        ),
-    ] = None,
-) -> None:
-    _collect_traces(
-        model_path,
-        dataset_path,
-        output_path,
-        max_input_length,
-        max_output_length,
-        batch_size,
-        num_tokens_to_generate,
-        CliCollectTracesCallbacks,
-    )
-
-
-@speculator_app.command(help="View model inference traces")
-def view_traces(
-    trace_path: Annotated[
-        Path,
-        Argument(
-            help="Trace file to view.",
-            metavar="TRACE_PATH",
-        ),
-    ],
-    model_path: Annotated[
-        Path,
-        Argument(
-            help="Path to the model directory for detokenization.",
-            metavar="MODEL_PATH",
-        ),
-    ],
-    num_completions: Annotated[
-        int | None,
-        Option(
-            help="Number of completions to show.",
-        ),
-    ] = None,
-) -> None:
-    model = LanguageModelConfig.load_model(model_path)
-    traces = iter_completions(trace_path)
-
-    table = Table(
-        show_lines=True,
-        box=box.ROUNDED,
-    )
-    table.add_column("Prefix")
-    table.add_column("Completion")
-
-    from rich.text import Text
-
-    for completion in islice(traces, num_completions):
-        detokenized_prefix = model.message_processor.detokenize(completion.prefix_token_ids)
-        detokenized_completion = model.message_processor.detokenize(completion.completion_token_ids)
-        table.add_row(Text(detokenized_prefix), Text(detokenized_completion))
-
-    console.print(table)
-
-
-@speculator_app.command("list", help="List registered speculator backends.")
-def list_speculator_backends() -> None:
-    table = Table(
-        show_header=True,
-        header_style="bold",
-        box=box.ROUNDED,
-    )
-    table.add_column("Name")
-    table.add_column("Train config")
-    table.add_column("Artifact config")
-    for backend in sorted(speculator_backends().values(), key=lambda backend: backend.name):
-        table.add_row(
-            backend.name,
-            backend.config_type.__name__,
-            "msgpack-tail",
-        )
-    console.print(table)
-
-
-@speculator_app.command("eval", help="Evaluate speculative decoding MAL and throughput.")
-def eval_speculator(
-    model_path: Annotated[
-        Path,
-        Argument(
-            help="Path to the model directory.",
-            metavar="MODEL_PATH",
-        ),
-    ],
-    speculator_path: Annotated[
-        Path | None,
-        Option(
-            "--speculator",
-            help="Path to a speculator artifact file.",
-            show_default="none",
-        ),
-    ] = None,
-    dataset_name: Annotated[
-        EvalDatasetName,
-        Option("--dataset", help="Evaluation dataset."),
-    ] = EvalDatasetName.MERGED,
-    num_questions: Annotated[
-        int | None,
-        Option("--num_questions", help="Number of questions to evaluate."),
-    ] = None,
-    batch_size: Annotated[
-        int,
-        Option("--batch_size", help="Batch size used for generation."),
-    ] = 32,
-    max_output_length: Annotated[
-        int,
-        Option("--max_output_length", help="Maximum number of generated tokens per question."),
-    ] = 4096,
-    mtbench_cache_path: Annotated[
-        Path | None,
-        Option(
-            "--mtbench_cache",
-            help="Cache path for MT-Bench questions.",
-            show_default="~/.cache/lalamo/eval/mt_bench_questions.jsonl",
-        ),
-    ] = None,
-    seed: Annotated[
-        int,
-        Option("--seed", help="Sampling seed."),
-    ] = 0,
-    warmup: Annotated[
-        bool,
-        Option("--warmup/--no-warmup", help="Run one warmup generation before measuring throughput."),
-    ] = True,
-    reasoning: Annotated[
-        bool,
-        Option("--reasoning/--no-reasoning", help="Enable model reasoning in rendered prompts."),
-    ] = False,
-) -> None:
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=err_console,
-        transient=True,
-    ) as progress:
-        progress_task = progress.add_task("📊 Evaluating speculative decoding...", total=None)
-        cache_path = mtbench_cache_path or Path.home() / ".cache" / "lalamo" / "eval" / "mt_bench_questions.jsonl"
-        results = _evaluate_speculator(
-            model_path=model_path,
-            dataset_name=dataset_name,
-            speculator_path=speculator_path,
-            mtbench_cache_path=cache_path,
-            num_questions=num_questions,
-            batch_size=batch_size,
-            max_output_length=max_output_length,
-            seed=seed,
-            warmup=warmup,
-            reasoning=reasoning,
-            progress_callback=lambda completed, total: progress.update(
-                progress_task,
-                completed=completed,
-                total=total,
-            ),
-        )
-    label = f"{dataset_name.value}, {speculator_path.name if speculator_path is not None else 'no-speculator'}"
-    config = results.config
-    config_table = Table(
-        title=f"Speculator eval config ({label})",
-        show_header=True,
-        header_style="bold",
-        box=box.ROUNDED,
-    )
-    config_table.add_column("Key")
-    config_table.add_column("Value")
-    config_table.add_row("dataset", config.dataset_name.value)
-    config_table.add_row("model_path", str(config.model_path))
-    config_table.add_row("speculator", str(config.speculator_path) if config.speculator_path is not None else "none")
-    config_table.add_row("questions", str(config.num_questions))
-    config_table.add_row("batch_size", str(config.batch_size))
-    config_table.add_row("max_output_length", str(config.max_output_length))
-    config_table.add_row("padded_length", str(config.padded_length))
-    config_table.add_row("reasoning", str(config.reasoning).lower())
-    config_table.add_row("warmup", str(config.warmup).lower())
-    config_table.add_row("seed", str(config.seed))
-    config_table.add_row("mtbench_cache", str(config.mtbench_cache_path))
-    console.print(config_table)
-
-    table = Table(
-        title=f"Speculator evaluation ({label})",
-        show_header=True,
-        header_style="bold",
-        box=box.ROUNDED,
-    )
-    table.add_column("Category", justify="right")
-    table.add_column("tok/step", justify="right")
-    table.add_column("tok/sec", justify="right")
-    table.add_column("draft_acc", justify="right")
-    table.add_column("spec_rate", justify="right")
-    table.add_column("questions", justify="right")
-
-    for category in sorted(results.by_category):
-        stats = results.by_category[category]
-        table.add_row(
-            category,
-            f"{stats.tokens_per_step:.2f}",
-            f"{stats.tokens_per_second:.2f}",
-            f"{stats.mean_draft_accepted:.2f}",
-            f"{stats.speculation_rate:.2%}",
-            str(stats.count),
-        )
-    table.add_section()
-    table.add_row(
-        "OVERALL",
-        f"{results.tokens_per_step:.2f}",
-        f"{results.tokens_per_second:.2f}",
-        f"{results.mean_draft_accepted:.2f}",
-        f"{results.speculation_rate:.2%}",
-        str(results.total_count),
-    )
-    console.print(table)
-
-
-@dataclass
-class CliTrainCallbacks(TrainCallbacks):
-    stack: ExitStack = field(default_factory=ExitStack)
-    loading_task: TaskID | None = None
-    training_task: TaskID | None = None
-
-    def started(self) -> None:
-        self.progress = self.stack.enter_context(
-            Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-                transient=True,
-            ),
-        )
-
-    def loading_model(self) -> None:
-        self.loading_task = self.progress.add_task("🧠 [cyan]Loading model...[/cyan]", total=None)
-
-    def finished_loading_model(self) -> None:
-        assert self.loading_task is not None
-        self.progress.remove_task(self.loading_task)
-        self.training_task = self.progress.add_task(
-            f"🔮 [cyan]Training {self.backend_name} speculator...[/cyan]",
-            total=None,
-        )
-
-    def training_progress(self, event: SpeculatorTrainingEvent) -> None:
-        assert self.training_task is not None
-        loss = "?" if event.loss is None else f"{event.loss:.4f}"
-        progress = event.progress
-        phase = event.phase.value
-        self.progress.update(
-            self.training_task,
-            completed=event.batch_index,
-            total=event.total_epoch_batches or None,
-            description=(
-                f"🔮 [cyan]Training {self.backend_name} speculator... "
-                f"epoch={event.epoch}/{event.total_epochs} "
-                f"{phase}_batch={event.batch_index}/{event.total_epoch_batches} "
-                f"train_tokens={progress.trained_tokens} "
-                f"eval_tokens={progress.evaluated_tokens} loss={loss}[/cyan]"
-            ),
-        )
-
-    def finished_training(self) -> None:
-        assert self.training_task is not None
-        self.progress.update(self.training_task, description="✅ Completed")
-        self.stack.close()
-        console.print(f"💾 Speculator saved to [cyan]{self.output_path}[/cyan]")
-
-
-def backend_train_command[ConfigT](
-    backend: type[SpeculatorBackend[ConfigT]],
-    train: Callable[..., None],
-    callbacks_type: type[object],
-) -> Callable[..., None]:
-    config_type = backend.config_type
-    if not is_dataclass(config_type):
-        raise TypeError(f"Speculator config type {config_type.__name__} must be a dataclass.")
-    config_type_fields = fields(config_type)
-    type_hints = get_type_hints(config_type, include_extras=True)
-
-    def command(**values: object) -> None:
-        backend_config = config_type(
-            **{config_field.name: values.pop(config_field.name) for config_field in config_type_fields},
-        )
-        train(
-            backend=backend,
-            backend_config=backend_config,
-            model_path=values["model_path"],
-            train_path=values["train_path"],
-            output_path=values["output_path"],
-            eval_path=values["eval_path"],
-            feature_device_id=values["feature_device_id"],
-            training_device_id=values["training_device_id"],
-            prompt_padding_multiple=values["prompt_padding_multiple"],
-            generation_padding_multiple=values["generation_padding_multiple"],
-            training_config=SpeculatorTrainingConfig(
-                batch_size=values["batch_size"],
-                max_prefetch=values["max_prefetch"],
-                top_k_logits=values["top_k_logits"],
-                epochs=values["epochs"],
-                eval_every_epochs=values["eval_every_epochs"],
-                early_stopping_patience=values["early_stopping_patience"],
-            ),
-            callbacks_type=callbacks_type,
-        )
-
-    parameters = [
-        Parameter(
-            "model_path",
-            kind=Parameter.POSITIONAL_OR_KEYWORD,
-            annotation=Annotated[Path, Argument(help="Path to the model directory.", metavar="MODEL_PATH")],
-        ),
-        Parameter(
-            "train_path",
-            kind=Parameter.POSITIONAL_OR_KEYWORD,
-            annotation=Annotated[
-                Path,
-                Argument(help="Training completion trace file.", metavar="TRAIN_COMPLETIONS"),
-            ],
-        ),
-        Parameter(
-            "output_path",
-            kind=Parameter.KEYWORD_ONLY,
-            default=...,
-            annotation=Annotated[
-                Path,
-                Option("--output", help="Path to save the speculator artifact file.", metavar="OUTPUT_PATH"),
-            ],
-        ),
-    ]
-    common_parameter_names = {
-        "batch_size",
-        "early_stopping_patience",
-        "epochs",
-        "eval_every_epochs",
-        "eval_path",
-        "feature_device_id",
-        "generation_padding_multiple",
-        "max_prefetch",
-        "model_path",
-        "output_path",
-        "prompt_padding_multiple",
-        "top_k_logits",
-        "training_device_id",
-        "train_path",
-    }
-    for config_field in config_type_fields:
-        if config_field.name in common_parameter_names:
-            raise ValueError(f"Speculator config field {config_field.name!r} conflicts with a common train argument.")
-        if config_field.default is not MISSING:
-            default = config_field.default
-        elif config_field.default_factory is not MISSING:
-            default = Parameter.empty
-        else:
-            default = ...
-        parameters.append(
-            Parameter(
-                config_field.name,
-                kind=Parameter.KEYWORD_ONLY,
-                default=default,
-                annotation=type_hints[config_field.name],
-            ),
-        )
-    parameters.extend(
-        [
-            Parameter(
-                "eval_path",
-                kind=Parameter.KEYWORD_ONLY,
-                default=None,
-                annotation=Annotated[
-                    Path | None,
-                    Option(
-                        "--eval-completions",
-                        help="Evaluation completion trace file.",
-                        show_default="disabled",
-                    ),
-                ],
-            ),
-            Parameter(
-                "batch_size",
-                kind=Parameter.KEYWORD_ONLY,
-                default=8,
-                annotation=Annotated[int, Option("--batch_size", help="Number of completions per training batch.")],
-            ),
-            Parameter(
-                "top_k_logits",
-                kind=Parameter.KEYWORD_ONLY,
-                default=128,
-                annotation=Annotated[
-                    int,
-                    Option("--top_k_logits", help="Number of target logits retained per token."),
-                ],
-            ),
-            Parameter(
-                "epochs",
-                kind=Parameter.KEYWORD_ONLY,
-                default=1,
-                annotation=Annotated[int, Option("--epochs", help="Number of training epochs.")],
-            ),
-            Parameter(
-                "eval_every_epochs",
-                kind=Parameter.KEYWORD_ONLY,
-                default=1,
-                annotation=Annotated[int, Option("--eval_every_epochs", help="Run evaluation every N epochs.")],
-            ),
-            Parameter(
-                "early_stopping_patience",
-                kind=Parameter.KEYWORD_ONLY,
-                default=None,
-                annotation=Annotated[
-                    int | None,
-                    Option("--early_stopping_patience", help="Stop after this many non-improving eval epochs."),
-                ],
-            ),
-            Parameter(
-                "max_prefetch",
-                kind=Parameter.KEYWORD_ONLY,
-                default=2,
-                annotation=Annotated[int, Option("--max_prefetch", help="Number of feature batches to prefetch.")],
-            ),
-            Parameter(
-                "prompt_padding_multiple",
-                kind=Parameter.KEYWORD_ONLY,
-                default=128,
-                annotation=Annotated[
-                    int,
-                    Option("--prompt_padding_multiple", help="Padding multiple for prompt feature tensors."),
-                ],
-            ),
-            Parameter(
-                "generation_padding_multiple",
-                kind=Parameter.KEYWORD_ONLY,
-                default=512,
-                annotation=Annotated[
-                    int,
-                    Option("--generation_padding_multiple", help="Padding multiple for generation feature tensors."),
-                ],
-            ),
-            Parameter(
-                "feature_device_id",
-                kind=Parameter.KEYWORD_ONLY,
-                default=0,
-                annotation=Annotated[
-                    int,
-                    Option("--feature_device_id", help="JAX device id used for target feature extraction."),
-                ],
-            ),
-            Parameter(
-                "training_device_id",
-                kind=Parameter.KEYWORD_ONLY,
-                default=0,
-                annotation=Annotated[
-                    int,
-                    Option("--training_device_id", help="JAX device id used for speculator training."),
-                ],
-            ),
-        ],
-    )
-    command.__name__ = f"train_{backend.name.replace('-', '_')}_speculator"
-    command.__signature__ = Signature(parameters)  # type: ignore[attr-defined]
-    return command
-
-
-def register_train_commands(
-    app: Typer,
-    backends: Iterable[type[SpeculatorBackend[object]]],
-    train: Callable[..., None],
-    callbacks_type: type[object],
-) -> None:
-    for backend in sorted(backends, key=lambda backend: backend.name):
-        app.command(
-            backend.name,
-            help=f"Train {backend.name} speculator from completion traces.",
-        )(backend_train_command(backend, train, callbacks_type))
-
-
-register_train_commands(speculator_train_app, speculator_backends().values(), _train, CliTrainCallbacks)
-
-
-@speculator_app.command(help="Inspect a speculator artifact.")
-def info(
-    speculator_path: Annotated[
-        Path,
-        Argument(
-            help="Path to the speculator artifact file.",
-            metavar="SPECULATOR_PATH",
-        ),
-    ],
-) -> None:
-    speculator_kind, fields = read_speculator_artifact(speculator_path)
-    table = Table(
-        show_header=True,
-        header_style="bold",
-        box=box.ROUNDED,
-    )
-    table.add_column("Field")
-    table.add_column("Value")
-    table.add_row("format", ARTIFACT_HEADER)
-    table.add_row("speculator_kind", speculator_kind)
-    for index, value in enumerate(fields):
-        if isinstance(value, bytes):
-            table.add_row(f"field[{index}]", f"{len(value)} bytes")
-        else:
-            table.add_row(f"field[{index}]", str(value))
-    console.print(table)
-
-
 @app.callback()
 def _profile_memory(
-    ctx: Context,
+    ctx: ClickContext,
     profile_memory: Annotated[
         Path | None,
         Option(

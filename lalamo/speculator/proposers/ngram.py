@@ -14,8 +14,8 @@ import xxhash
 from typer import Option
 
 from lalamo.data.completion_features import FeatureRequest, LalamoCompletionFeatures
-from lalamo.data.lalamo_completions import LalamoCompletion  # noqa: TC001
-from lalamo.modules.decoder import Decoder  # noqa: TC001
+from lalamo.data.lalamo_completions import LalamoCompletion
+from lalamo.modules.decoder import Decoder
 from lalamo.speculator.common import (
     EmptySpeculatorDraftState,
     Speculator,
@@ -24,7 +24,7 @@ from lalamo.speculator.common import (
     SpeculatorState,
     write_speculator_artifact,
 )
-from lalamo.speculator.proposal import TrieProposal  # noqa: TC001
+from lalamo.speculator.proposal import TrieProposal
 from lalamo.speculator.state import LMState, StateRequest
 from lalamo.speculator.training import (
     SpeculatorBatchResult,

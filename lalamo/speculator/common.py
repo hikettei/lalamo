@@ -9,9 +9,9 @@ import msgpack
 from jaxtyping import Array, Bool, Int
 
 from lalamo.modules.decoder import Decoder
-from lalamo.registry_abc import RegistryABC
 from lalamo.speculator.proposal import AcceptedProposal, TrieProposal
 from lalamo.speculator.state import LMState, MemoryBuffers, RingBuffer, StateRequest
+from lalamo.utils.registry_abc import RegistryABC
 
 __all__ = [
     "ARTIFACT_HEADER",
@@ -99,7 +99,7 @@ class NoSpeculator(Speculator):
 
 class SpeculatorBackend[ConfigT](RegistryABC):
     name: ClassVar[str]
-    config_type: ClassVar[type[ConfigT]]
+    config_type: ClassVar[type[Any]]
 
     @classmethod
     @abstractmethod

@@ -1,14 +1,14 @@
-from typing import Annotated
+from typing import Annotated, Any
 
-from annotated_types import Ge
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+from annotated_types import Ge
 from jaxtyping import Array, Bool, Float, Int, Key
 
 from lalamo.modules.decoder import DecoderActivationTrace, DecoderResult
-from lalamo.modules.token_mixers.state.common import State
-from lalamo.modules.token_mixers.state.kv_cache import compact_state_layers
+from lalamo.modules.token_mixer import State
+from lalamo.modules.token_mixers.kv_cache import StaticKVCacheLayer, compact_state_layers
 from lalamo.sampling import SamplingPolicy
 from lalamo.speculator.proposal import AcceptedProposal, TrieProposal
 
@@ -314,7 +314,7 @@ class LMState(eqx.Module):
     @classmethod
     def from_prefill(
         cls,
-        prefill_results: "PrefillResults",
+        prefill_results: Any,  # noqa: ANN401
         next_token_position: Int[Array, " batch"],
         sampling_policy: SamplingPolicy,
         root_sample_keys: Key[Array, " batch"],
@@ -323,10 +323,7 @@ class LMState(eqx.Module):
             sampling_policy,
             prefill_results.last_token_logits,
         )
-        root_bonus_id = jax.vmap(lambda key, logits: jax.random.categorical(key, logits))(
-            root_sample_keys,
-            root_sample_logits,
-        ).astype(jnp.int32)
+        root_bonus_id = jax.vmap(jax.random.categorical)(root_sample_keys, root_sample_logits).astype(jnp.int32)
         return cls(
             kv_cache=prefill_results.state,
             next_token_position=next_token_position,
@@ -376,10 +373,13 @@ class LMState(eqx.Module):
     ) -> "LMState":
         updated_state = decoder_result.updated_state
         assert updated_state is not None, "updated_state should not be None"
+        first_layer = self.kv_cache[0]
+        if not isinstance(first_layer, StaticKVCacheLayer):
+            raise TypeError(f"speculative decoding requires StaticKVCacheLayer, got {type(first_layer).__name__}")
         if accepted.compact_indices.shape[1] > 1:
             kv_cache = compact_state_layers(
                 updated_state,
-                cache_len=self.kv_cache[0].prefix_lengths(),
+                cache_len=first_layer.current_length,
                 accepted_indices=accepted.compact_indices,
                 num_accepted=accepted.num_compact_indices,
                 max_slots=accepted.compact_indices.shape[1],

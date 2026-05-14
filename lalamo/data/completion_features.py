@@ -15,7 +15,7 @@ from lalamo.data.utils import make_target_positions, pad_sequences, round_up_to_
 class FeatureRequest:
     completions: tuple[LalamoCompletion, ...]
     top_k_logits: Annotated[int, Ge(1)] = 128
-    layer_indices: tuple[int, ...] = tuple()
+    layer_indices: tuple[int, ...] = ()
     output_features: bool = False
 
 

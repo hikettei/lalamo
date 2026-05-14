@@ -3,9 +3,9 @@ from __future__ import annotations
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int, Key
+from jaxtyping import Array, Bool, Float, Int, Key  # noqa: TC002
 
-from lalamo.modules.common import ForwardPassMode
+from lalamo.module import ForwardPassMode
 from lalamo.sampling import SamplingPolicy
 
 __all__ = ["AcceptedProposal", "ProposalInputs", "TrieProposal"]
@@ -39,7 +39,7 @@ class AcceptedProposal(eqx.Module):
         max_output_length: int,
         done: Bool[Array, " batch"],
         eos_token_ids: Int[Array, " eos_tokens"],
-    ) -> tuple["AcceptedProposal", Bool[Array, "batch max_slots"]]:
+    ) -> tuple[AcceptedProposal, Bool[Array, "batch max_slots"]]:
         slots = jnp.arange(self.accepted_token_ids.shape[1], dtype=jnp.int32)[None, :]
         valid = jnp.logical_and(
             slots < self.num_compact_indices[:, None],
@@ -152,11 +152,13 @@ class TrieProposal(eqx.Module):
         batch_indices = jnp.arange(self.batch_size, dtype=jnp.int32)[:, None]
         safe_positions = jnp.clip(sample_positions, 0, per_position_keys.shape[1] - 1)
         sample_keys = per_position_keys[batch_indices, safe_positions]
-        token_ids = jax.vmap(
-            lambda row_keys, row_logits: jax.vmap(
-                lambda key, row_logit: jax.random.categorical(key, row_logit),
-            )(row_keys, row_logits),
-        )(sample_keys, processed_logits).astype(jnp.int32)
+        def sample_row(
+            row_keys: Key[Array, " nodes"],
+            row_logits: Float[Array, "nodes vocabulary"],
+        ) -> Int[Array, " nodes"]:
+            return jax.vmap(jax.random.categorical)(row_keys, row_logits)
+
+        token_ids = jax.vmap(sample_row)(sample_keys, processed_logits).astype(jnp.int32)
         return processed_logits, jnp.where(self.node_mask, token_ids, -1)
 
     def forward_inputs(
