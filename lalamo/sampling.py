@@ -173,7 +173,7 @@ class SamplingPolicy(eqx.Module):
         parent_indices: Int[Array, " nodes"],
         node_mask: Bool[Array, " nodes"],
     ) -> Float[Array, "nodes vocabulary"]:
-        num_nodes = token_ids.shape[0]
+        (num_nodes,) = token_ids.shape
 
         def broadcast_policy(policy: SamplingPolicy) -> SamplingPolicy:
             return jax.tree.map(
