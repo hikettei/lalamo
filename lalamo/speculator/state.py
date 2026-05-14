@@ -46,6 +46,24 @@ class StateRequest(eqx.Module):
     def requires_activation_trace(self) -> bool:
         return self.output_norm_capacity > 0 or self.layer_capacity > 0
 
+    def with_generation_buffers(
+        self,
+        *,
+        max_output_length: int,
+        num_top_logits_to_return: int | None,
+    ) -> "StateRequest":
+        return StateRequest(
+            token_id_capacity=max(self.token_id_capacity, max_output_length),
+            sampling_top_k_capacity=max_output_length if num_top_logits_to_return is not None else 0,
+            sampling_top_k_count=num_top_logits_to_return or 0,
+            trace_top_k_capacity=self.trace_top_k_capacity,
+            trace_top_k_count=self.trace_top_k_count,
+            logsumexp_capacity=self.logsumexp_capacity,
+            output_norm_capacity=self.output_norm_capacity,
+            layer_capacity=self.layer_capacity,
+            layer_indices=self.layer_indices,
+        )
+
 
 class RingBuffer(eqx.Module):
     values: Array
