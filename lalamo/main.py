@@ -19,10 +19,13 @@ from rich import box
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import (
+    MofNCompleteColumn,
     Progress,
     SpinnerColumn,
     TaskID,
     TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
 )
 from rich.prompt import Confirm
 from rich.table import Table
@@ -32,10 +35,13 @@ from lalamo.audio.utils import play_mono_audio
 from lalamo.commands import (
     ConversionCallbacks,
     DType,
+    EvalDatasetName,
+    EvalResults,
     PullCallbacks,
     _suggest_similar_models,
 )
 from lalamo.commands import convert as _convert
+from lalamo.commands import evaluate_speculator as _evaluate_speculator
 from lalamo.commands import pull as _pull
 from lalamo.model_import import ModelSpec
 from lalamo.model_import.common import FileSpec
@@ -60,6 +66,8 @@ app = Typer(
     add_completion=False,
     pretty_exceptions_show_locals=False,
 )
+speculator_app = Typer(no_args_is_help=True)
+app.add_typer(speculator_app, name="speculator", help="Speculator utilities.")
 
 
 class ModelParser(ParamType):
@@ -590,6 +598,150 @@ def server(
         cache_dir = Path.home() / ".cache" / "lalamo" / "batches"
 
     start_server(host=host, port=port, vram_bytes=vram_bytes, cache_dir=cache_dir)
+
+
+def print_speculator_eval_results(results: EvalResults) -> None:
+    config = results.config
+    speculator_name = config.speculator_path.name if config.speculator_path is not None else "no-speculator"
+    label = f"{config.dataset_name.value}, {speculator_name}"
+    config_table = Table(
+        title=f"Speculator eval config ({label})",
+        show_header=True,
+        header_style="bold",
+        box=box.ROUNDED,
+    )
+    config_table.add_column("Key")
+    config_table.add_column("Value")
+    config_table.add_row("dataset", config.dataset_name.value)
+    config_table.add_row("model_path", str(config.model_path))
+    config_table.add_row("speculator", str(config.speculator_path) if config.speculator_path is not None else "none")
+    config_table.add_row("questions", str(config.num_questions))
+    config_table.add_row("batch_size", str(config.batch_size))
+    config_table.add_row("max_output_length", str(config.max_output_length))
+    config_table.add_row("padded_length", str(config.padded_length))
+    config_table.add_row("warmup", str(config.warmup).lower())
+    config_table.add_row("seed", str(config.seed))
+    config_table.add_row("mtbench_cache", str(config.mtbench_cache_path))
+    console.print(config_table)
+
+    table = Table(
+        title=f"Speculator evaluation ({label})",
+        show_header=True,
+        header_style="bold",
+        box=box.ROUNDED,
+    )
+    table.add_column("Category", justify="right")
+    table.add_column("tok/step", justify="right")
+    table.add_column("tok/sec", justify="right")
+    table.add_column("draft_acc", justify="right")
+    table.add_column("spec_rate", justify="right")
+    table.add_column("questions", justify="right")
+
+    for category in sorted(results.by_category):
+        stats = results.by_category[category]
+        table.add_row(
+            category,
+            f"{stats.tokens_per_step:.2f}",
+            f"{stats.tokens_per_second:.2f}",
+            f"{stats.mean_draft_accepted:.2f}",
+            f"{stats.speculation_rate:.2%}",
+            str(stats.count),
+        )
+    table.add_section()
+    table.add_row(
+        "OVERALL",
+        f"{results.tokens_per_step:.2f}",
+        f"{results.tokens_per_second:.2f}",
+        f"{results.mean_draft_accepted:.2f}",
+        f"{results.speculation_rate:.2%}",
+        str(results.total_count),
+    )
+    console.print(table)
+
+
+@speculator_app.command("eval", help="Evaluate speculative decoding MAL and throughput.")
+def eval_speculator(
+    model_path: Annotated[
+        Path,
+        Argument(
+            help="Path to the model directory.",
+            metavar="MODEL_PATH",
+        ),
+    ],
+    speculator_path: Annotated[
+        Path | None,
+        Option(
+            "--speculator",
+            help="Path to a speculator artifact file.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            show_default="none",
+        ),
+    ] = None,
+    dataset_name: Annotated[
+        EvalDatasetName,
+        Option("--dataset", help="Evaluation dataset."),
+    ] = EvalDatasetName.MERGED,
+    num_questions: Annotated[
+        int | None,
+        Option("--num_questions", "--num-questions", help="Number of questions to evaluate."),
+    ] = None,
+    batch_size: Annotated[
+        int,
+        Option("--batch_size", "--batch-size", help="Batch size used for generation."),
+    ] = 32,
+    max_output_length: Annotated[
+        int,
+        Option("--max_output_length", "--max-output-length", help="Maximum number of generated tokens per question."),
+    ] = 4096,
+    mtbench_cache_path: Annotated[
+        Path | None,
+        Option(
+            "--mtbench_cache",
+            "--mtbench-cache",
+            help="Cache path for MT-Bench questions.",
+            show_default="~/.cache/lalamo/eval/mt_bench_questions.jsonl",
+        ),
+    ] = None,
+    seed: Annotated[
+        int,
+        Option("--seed", help="Sampling seed."),
+    ] = 0,
+    warmup: Annotated[
+        bool,
+        Option("--warmup/--no-warmup", help="Run one warmup generation before measuring throughput."),
+    ] = True,
+) -> None:
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=err_console,
+        transient=True,
+    ) as progress:
+        progress_task = progress.add_task("📊 Evaluating speculative decoding...", total=None)
+        cache_path = mtbench_cache_path or Path.home() / ".cache" / "lalamo" / "eval" / "mt_bench_questions.jsonl"
+        results = _evaluate_speculator(
+            model_path=model_path,
+            dataset_name=dataset_name,
+            speculator_path=speculator_path,
+            mtbench_cache_path=cache_path,
+            num_questions=num_questions,
+            batch_size=batch_size,
+            max_output_length=max_output_length,
+            seed=seed,
+            warmup=warmup,
+            progress_callback=lambda completed, total: progress.update(
+                progress_task,
+                completed=completed,
+                total=total,
+            ),
+        )
+    print_speculator_eval_results(results)
 
 
 @app.callback()

@@ -80,6 +80,7 @@ class GenerationResults(NamedTuple):
     token_ids: Int[Array, "batch response_tokens"]
     top_k_token_ids: Int[Array, "batch response_tokens k"] | None
     top_k_token_logits: Float[Array, "batch response_tokens k"] | None
+    num_tokens_per_step: Int[Array, "batch steps"] | None
 
 
 @dataclass(frozen=True)
@@ -458,6 +459,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
         prefill_forward_pass_config: DecoderForwardPassConfig | None = None,
         decode_forward_pass_config: DecoderForwardPassConfig | None = None,
         speculator: Speculator | None = None,
+        return_num_tokens_per_step: bool = False,
         *,
         keychain: Keychain,
     ) -> GenerationResults:
@@ -496,7 +498,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
                 decoding_key,
             )
 
-        final_state, _ = jax.lax.scan(scan_step, setup.initial_state, setup.decoding_keys)
+        final_state, num_tokens_per_step = jax.lax.scan(scan_step, setup.initial_state, setup.decoding_keys)
         memory = final_state.lm_state.memory
         assert memory.token_ids is not None
         token_ids, token_mask = memory.token_ids.window(prompt_lengths_without_padding, max_output_length)
@@ -519,6 +521,9 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             token_ids=token_ids,
             top_k_token_ids=top_k_token_ids,
             top_k_token_logits=top_k_token_logits,
+            num_tokens_per_step=(
+                rearrange(num_tokens_per_step, "step batch -> batch step") if return_num_tokens_per_step else None
+            ),
         )
 
     def reply(
