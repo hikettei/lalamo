@@ -16,10 +16,22 @@ class AcceptedProposal(eqx.Module):
     node_indices: Int[Array, "batch max_slots"]
     compact_indices: Int[Array, "batch max_slots"]
     num_compact_indices: Int[Array, " batch"]
+    terminal_node_indices: Int[Array, " batch"]
     bonus_token_ids: Int[Array, " batch"]
-    terminal_sample_logits: Float[Array, "batch vocabulary"]
-    sampling_top_k_ids: Int[Array, "batch max_slots k"] | None = None
-    sampling_top_k_logits: Float[Array, "batch max_slots k"] | None = None
+
+    def accepted_token_logits(
+        self,
+        processed_tree_logits: Float[Array, "batch nodes vocabulary"],
+        root_sample_logits: Float[Array, "batch vocabulary"],
+    ) -> Float[Array, "batch max_slots vocabulary"]:
+        batch_size, _ = self.compact_indices.shape
+        batch_indices = jnp.arange(batch_size, dtype=jnp.int32)[:, None]
+        parent_logit_indices = jnp.concatenate(
+            [jnp.zeros((batch_size, 1), dtype=jnp.int32), self.compact_indices[:, :-1]],
+            axis=1,
+        )
+        token_logits = processed_tree_logits[batch_indices, parent_logit_indices]
+        return token_logits.at[:, 0].set(root_sample_logits)
 
     def truncate(
         self,
@@ -115,318 +127,39 @@ class TrieProposal(eqx.Module):
             node_index,
         )
 
-    def sample_and_verify(
+    def sample(
         self,
         logits: Float[Array, "batch nodes vocabulary"],
         sampling_policy: SamplingPolicy,
         output_lengths: Int[Array, " batch"],
         per_position_keys: Key[Array, "batch positions"],
-        root_sample_logits: Float[Array, "batch vocabulary"],
-        num_top_logits_to_return: int | None,
-    ) -> AcceptedProposal:
-        batch_size, max_slots = self.token_ids.shape
-        batch_indices = jnp.arange(batch_size, dtype=jnp.int32)
-        candidate_node_indices = jnp.arange(max_slots, dtype=jnp.int32)[None, :]
-        initial_policy = jax.vmap(
-            lambda policy, token_id, should_count: policy.with_next_token_count(token_id, should_count),
+    ) -> tuple[Float[Array, "batch nodes vocabulary"], Int[Array, "batch nodes"]]:
+        processed_logits = jax.vmap(
+            lambda policy, row_logits, token_ids, parent_indices, node_mask: policy.process_tree_logits(
+                row_logits.astype(jnp.float32),
+                token_ids,
+                parent_indices,
+                node_mask,
+            ),
         )(
             sampling_policy,
-            self.token_ids[:, 0],
-            self.node_mask[:, 0],
+            logits,
+            self.token_ids,
+            self.parent_indices,
+            self.node_mask,
         )
-        initial_carry = (
-            initial_policy,
-            jnp.zeros((batch_size,), dtype=jnp.int32),
-            jnp.ones((batch_size,), dtype=jnp.bool),
-            jnp.zeros((batch_size,), dtype=jnp.int32),
-            jnp.zeros_like(logits[:, 0, :], dtype=jnp.float32),
-        )
+        sample_positions = output_lengths[:, None] + self.depths + 1
+        batch_indices = jnp.arange(self.batch_size, dtype=jnp.int32)[:, None]
+        safe_positions = jnp.clip(sample_positions, 0, per_position_keys.shape[1] - 1)
+        sample_keys = per_position_keys[batch_indices, safe_positions]
+        def sample_row(
+            row_keys: Key[Array, " nodes"],
+            row_logits: Float[Array, "nodes vocabulary"],
+        ) -> Int[Array, " nodes"]:
+            return jax.vmap(jax.random.categorical)(row_keys, row_logits)
 
-        def advance(
-            carry: tuple[
-                SamplingPolicy,
-                Int[Array, " batch"],
-                Bool[Array, " batch"],
-                Int[Array, " batch"],
-                Float[Array, "batch vocabulary"],
-            ],
-        ) -> tuple[
-            tuple[
-                SamplingPolicy,
-                Int[Array, " batch"],
-                Bool[Array, " batch"],
-                Int[Array, " batch"],
-                Float[Array, "batch vocabulary"],
-            ],
-            Int[Array, " batch"],
-            Bool[Array, " batch"],
-            Float[Array, "batch vocabulary"],
-        ]:
-            current_policy, terminal_node_indices, alive, bonus_token_ids, terminal_sample_logits = carry
-            terminal_depths = self.depths[batch_indices, terminal_node_indices]
-            sample_positions = output_lengths + terminal_depths + 1
-            safe_positions = jnp.clip(sample_positions, 0, per_position_keys.shape[1] - 1)
-            sample_keys = per_position_keys[batch_indices, safe_positions]
-            terminal_logits = logits[batch_indices, terminal_node_indices]
-            sampled_logits = jax.vmap(
-                lambda policy, row_logits: policy.process_logits(row_logits.astype(jnp.float32))
-            )(
-                current_policy,
-                terminal_logits,
-            )
-            sampled_token_ids = jax.vmap(jax.random.categorical)(sample_keys, sampled_logits).astype(jnp.int32)
-            child_mask = (
-                self.node_mask
-                & (candidate_node_indices > 0)
-                & (self.parent_indices == terminal_node_indices[:, None])
-                & (self.token_ids == sampled_token_ids[:, None])
-            )
-            accepted = alive & jnp.any(child_mask, axis=1)
-            child_indices = jnp.argmax(child_mask, axis=1).astype(jnp.int32)
-            next_terminal_node_indices = jnp.where(accepted, child_indices, terminal_node_indices)
-            next_policy = jax.vmap(
-                lambda policy, token_id, should_count: policy.with_next_token_count(token_id, should_count),
-            )(
-                current_policy,
-                self.token_ids[batch_indices, child_indices],
-                accepted,
-            )
-            next_bonus_token_ids = jnp.where(alive, sampled_token_ids, bonus_token_ids)
-            next_terminal_sample_logits = jnp.where(alive[:, None], sampled_logits, terminal_sample_logits)
-            return (
-                (
-                    next_policy,
-                    next_terminal_node_indices,
-                    accepted,
-                    next_bonus_token_ids,
-                    next_terminal_sample_logits,
-                ),
-                child_indices,
-                accepted,
-                sampled_logits,
-            )
-
-        def step(
-            carry: tuple[
-                SamplingPolicy,
-                Int[Array, " batch"],
-                Bool[Array, " batch"],
-                Int[Array, " batch"],
-                Float[Array, "batch vocabulary"],
-            ],
-            _: None,
-        ) -> tuple[
-            tuple[
-                SamplingPolicy,
-                Int[Array, " batch"],
-                Bool[Array, " batch"],
-                Int[Array, " batch"],
-                Float[Array, "batch vocabulary"],
-            ],
-            tuple[Int[Array, " batch"], Bool[Array, " batch"]],
-        ]:
-            def active_step(
-                carry: tuple[
-                    SamplingPolicy,
-                    Int[Array, " batch"],
-                    Bool[Array, " batch"],
-                    Int[Array, " batch"],
-                    Float[Array, "batch vocabulary"],
-                ],
-            ) -> tuple[
-                tuple[
-                    SamplingPolicy,
-                    Int[Array, " batch"],
-                    Bool[Array, " batch"],
-                    Int[Array, " batch"],
-                    Float[Array, "batch vocabulary"],
-                ],
-                tuple[Int[Array, " batch"], Bool[Array, " batch"]],
-            ]:
-                next_carry, child_indices, accepted, _sampled_logits = advance(carry)
-                return next_carry, (child_indices, accepted)
-
-            def inactive_step(
-                carry: tuple[
-                    SamplingPolicy,
-                    Int[Array, " batch"],
-                    Bool[Array, " batch"],
-                    Int[Array, " batch"],
-                    Float[Array, "batch vocabulary"],
-                ],
-            ) -> tuple[
-                tuple[
-                    SamplingPolicy,
-                    Int[Array, " batch"],
-                    Bool[Array, " batch"],
-                    Int[Array, " batch"],
-                    Float[Array, "batch vocabulary"],
-                ],
-                tuple[Int[Array, " batch"], Bool[Array, " batch"]],
-            ]:
-                return carry, (
-                    jnp.zeros((batch_size,), dtype=jnp.int32),
-                    jnp.zeros((batch_size,), dtype=jnp.bool),
-                )
-
-            return jax.lax.cond(jnp.any(carry[2]), active_step, inactive_step, carry)
-
-        if num_top_logits_to_return is None:
-            (
-                (
-                    _final_policy,
-                    _terminal_node_indices,
-                    _final_alive,
-                    bonus_token_ids,
-                    terminal_sample_logits,
-                ),
-                (path_node_indices, path_mask),
-            ) = jax.lax.scan(
-                step,
-                initial_carry,
-                xs=None,
-                length=max_slots,
-            )
-            sampling_top_k_ids = None
-            sampling_top_k_logits = None
-        else:
-            root_top_k_logits, root_top_k_ids = jax.lax.top_k(root_sample_logits, num_top_logits_to_return)
-
-            def top_k_step(
-                carry: tuple[
-                    SamplingPolicy,
-                    Int[Array, " batch"],
-                    Bool[Array, " batch"],
-                    Int[Array, " batch"],
-                    Float[Array, "batch vocabulary"],
-                ],
-                _: None,
-            ) -> tuple[
-                tuple[
-                    SamplingPolicy,
-                    Int[Array, " batch"],
-                    Bool[Array, " batch"],
-                    Int[Array, " batch"],
-                    Float[Array, "batch vocabulary"],
-                ],
-                tuple[
-                    Int[Array, " batch"],
-                    Bool[Array, " batch"],
-                    Int[Array, "batch k"],
-                    Float[Array, "batch k"],
-                ],
-            ]:
-                def active_step(
-                    carry: tuple[
-                        SamplingPolicy,
-                        Int[Array, " batch"],
-                        Bool[Array, " batch"],
-                        Int[Array, " batch"],
-                        Float[Array, "batch vocabulary"],
-                    ],
-                ) -> tuple[
-                    tuple[
-                        SamplingPolicy,
-                        Int[Array, " batch"],
-                        Bool[Array, " batch"],
-                        Int[Array, " batch"],
-                        Float[Array, "batch vocabulary"],
-                    ],
-                    tuple[
-                        Int[Array, " batch"],
-                        Bool[Array, " batch"],
-                        Int[Array, "batch k"],
-                        Float[Array, "batch k"],
-                    ],
-                ]:
-                    next_carry, child_indices, accepted, sampled_logits = advance(carry)
-                    top_k_logits, top_k_ids = jax.lax.top_k(sampled_logits, num_top_logits_to_return)
-                    top_k_ids = jnp.where(accepted[:, None], top_k_ids, jnp.zeros_like(top_k_ids))
-                    top_k_logits = jnp.where(accepted[:, None], top_k_logits, jnp.zeros_like(top_k_logits))
-                    return next_carry, (child_indices, accepted, top_k_ids, top_k_logits)
-
-                def inactive_step(
-                    carry: tuple[
-                        SamplingPolicy,
-                        Int[Array, " batch"],
-                        Bool[Array, " batch"],
-                        Int[Array, " batch"],
-                        Float[Array, "batch vocabulary"],
-                    ],
-                ) -> tuple[
-                    tuple[
-                        SamplingPolicy,
-                        Int[Array, " batch"],
-                        Bool[Array, " batch"],
-                        Int[Array, " batch"],
-                        Float[Array, "batch vocabulary"],
-                    ],
-                    tuple[
-                        Int[Array, " batch"],
-                        Bool[Array, " batch"],
-                        Int[Array, "batch k"],
-                        Float[Array, "batch k"],
-                    ],
-                ]:
-                    return carry, (
-                        jnp.zeros((batch_size,), dtype=jnp.int32),
-                        jnp.zeros((batch_size,), dtype=jnp.bool),
-                        jnp.zeros((batch_size, num_top_logits_to_return), dtype=jnp.int32),
-                        jnp.zeros((batch_size, num_top_logits_to_return), dtype=jnp.float32),
-                    )
-
-                return jax.lax.cond(jnp.any(carry[2]), active_step, inactive_step, carry)
-
-            (
-                (
-                    _final_policy,
-                    _terminal_node_indices,
-                    _final_alive,
-                    bonus_token_ids,
-                    terminal_sample_logits,
-                ),
-                (path_node_indices, path_mask, path_top_k_ids, path_top_k_logits),
-            ) = jax.lax.scan(
-                top_k_step,
-                initial_carry,
-                xs=None,
-                length=max_slots,
-            )
-            path_top_k_ids = jnp.swapaxes(path_top_k_ids, 0, 1)
-            path_top_k_logits = jnp.swapaxes(path_top_k_logits, 0, 1)
-            sampling_top_k_ids = jnp.concatenate(
-                [root_top_k_ids[:, None, :], path_top_k_ids[:, :-1]],
-                axis=1,
-            )
-            sampling_top_k_logits = jnp.concatenate(
-                [root_top_k_logits[:, None, :], path_top_k_logits[:, :-1]],
-                axis=1,
-            )
-
-        path_node_indices = jnp.swapaxes(path_node_indices, 0, 1)
-        path_mask = jnp.swapaxes(path_mask, 0, 1)
-        node_indices = jnp.where(path_mask, path_node_indices, 0)
-        compact_indices = jnp.concatenate(
-            [jnp.zeros((batch_size, 1), dtype=jnp.int32), node_indices[:, :-1]],
-            axis=1,
-        )
-        num_compact_indices = jnp.sum(path_mask, axis=1).astype(jnp.int32) + 1
-        slots = jnp.arange(max_slots, dtype=jnp.int32)[None, :]
-        accepted_token_ids = jnp.where(
-            slots < num_compact_indices[:, None],
-            jnp.take_along_axis(self.token_ids, compact_indices, axis=1),
-            -1,
-        )
-        return AcceptedProposal(
-            accepted_token_ids=accepted_token_ids,
-            node_indices=node_indices,
-            compact_indices=compact_indices,
-            num_compact_indices=num_compact_indices,
-            bonus_token_ids=bonus_token_ids,
-            terminal_sample_logits=terminal_sample_logits,
-            sampling_top_k_ids=sampling_top_k_ids,
-            sampling_top_k_logits=sampling_top_k_logits,
-        )
+        token_ids = jax.vmap(sample_row)(sample_keys, processed_logits).astype(jnp.int32)
+        return processed_logits, jnp.where(self.node_mask, token_ids, -1)
 
     def forward_inputs(
         self,
@@ -445,4 +178,81 @@ class TrieProposal(eqx.Module):
             lengths_without_padding=jnp.full((self.batch_size,), self.num_nodes, dtype=jnp.int32),
             forward_pass_mode=forward_pass_mode,
             attention_parent_indices=attention_parent_indices,
+        )
+
+    def verify(self, sampled_token_ids: Int[Array, "batch nodes"]) -> AcceptedProposal:
+        batch_indices = jnp.arange(self.batch_size, dtype=jnp.int32)
+        if self.num_nodes == 1:
+            zeros = jnp.zeros((self.batch_size, 1), dtype=jnp.int32)
+            return AcceptedProposal(
+                accepted_token_ids=self.token_ids[:, :1],
+                node_indices=zeros,
+                compact_indices=zeros,
+                num_compact_indices=jnp.ones((self.batch_size,), dtype=jnp.int32),
+                terminal_node_indices=jnp.zeros((self.batch_size,), dtype=jnp.int32),
+                bonus_token_ids=sampled_token_ids[:, 0],
+            )
+
+        candidate_node_indices = jnp.arange(self.budget, dtype=jnp.int32)[None, :]
+
+        def scan_step(
+            carry: tuple[Int[Array, " batch"], Bool[Array, " batch"]],
+            _: None,
+        ) -> tuple[
+            tuple[Int[Array, " batch"], Bool[Array, " batch"]],
+            tuple[Int[Array, " batch"], Bool[Array, " batch"]],
+        ]:
+            terminal_node_indices, alive = carry
+            sampled_at_terminal = sampled_token_ids[batch_indices, terminal_node_indices]
+            child_mask = jnp.logical_and(
+                self.node_mask,
+                jnp.logical_and(
+                    candidate_node_indices > 0,
+                    jnp.logical_and(
+                        self.parent_indices == terminal_node_indices[:, None],
+                        self.token_ids == sampled_at_terminal[:, None],
+                    ),
+                ),
+            )
+            accepted = jnp.logical_and(alive, jnp.any(child_mask, axis=1))
+            child_indices = jnp.argmax(child_mask, axis=1).astype(jnp.int32)
+            next_terminal_node_indices = jnp.where(accepted, child_indices, terminal_node_indices)
+            return (next_terminal_node_indices, accepted), (child_indices, accepted)
+
+        (terminal_node_indices, _), (path_node_indices, path_mask) = jax.lax.scan(
+            scan_step,
+            (jnp.zeros((self.batch_size,), dtype=jnp.int32), jnp.ones((self.batch_size,), dtype=jnp.bool)),
+            xs=None,
+            length=self.budget - 1,
+        )
+
+        path_node_indices = path_node_indices.T
+        path_mask = path_mask.T
+        node_indices = jnp.concatenate(
+            [
+                jnp.where(path_mask, path_node_indices, 0),
+                jnp.zeros((self.batch_size, 1), dtype=jnp.int32),
+            ],
+            axis=1,
+        )
+        compact_indices = jnp.concatenate(
+            [jnp.zeros((self.batch_size, 1), dtype=jnp.int32), node_indices[:, :-1]],
+            axis=1,
+        )
+        num_compact_indices = jnp.sum(path_mask, axis=1).astype(jnp.int32) + 1
+        slots = jnp.arange(self.budget, dtype=jnp.int32)[None, :]
+        accepted_token_ids = jnp.where(
+            slots < num_compact_indices[:, None],
+            jnp.take_along_axis(self.token_ids, compact_indices, axis=1),
+            -1,
+        )
+        bonus_token_ids = sampled_token_ids[batch_indices, terminal_node_indices]
+
+        return AcceptedProposal(
+            accepted_token_ids=accepted_token_ids,
+            node_indices=node_indices,
+            compact_indices=compact_indices,
+            num_compact_indices=num_compact_indices,
+            terminal_node_indices=terminal_node_indices,
+            bonus_token_ids=bonus_token_ids,
         )
