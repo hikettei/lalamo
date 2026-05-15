@@ -45,6 +45,7 @@ from lalamo.models import LanguageModel, TTSModel
 from lalamo.models.chat_codec import Message, UserMessage
 from lalamo.models.tts_codec import TTSMessage
 from lalamo.module import Keychain
+from lalamo.speculator.common import load_speculator
 from lalamo.utils.memory import get_available_bytes_on_default_device
 
 SCRIPT_NAME = Path(sys.argv[0]).name
@@ -122,6 +123,18 @@ def chat(
             help="Maximum number of tokens to generate per reply.",
         ),
     ] = 8192,
+    speculator_path: Annotated[
+        Path | None,
+        Option(
+            "--speculator",
+            help="Path to a speculator artifact.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+            show_default="No speculator",
+        ),
+    ] = None,
 ) -> None:
     with Progress(
         SpinnerColumn(),
@@ -131,12 +144,14 @@ def chat(
     ) as progress:
         loading_task = progress.add_task("🚀 [cyan]Loading model...[/cyan]")
         model = LanguageModel.load(model_path)
+        speculator = None if speculator_path is None else load_speculator(speculator_path, model.decoder)
         progress.remove_task(loading_task)
         warmup_task = progress.add_task("🔥 Warming up compilation cache...")
         warmup_tokens = iter(
             model.stream_reply_text(
                 [UserMessage("")],
                 max_output_length=max_tokens,
+                speculator=speculator,
                 keychain=Keychain.init(0),
             ),
         )
@@ -160,6 +175,7 @@ def chat(
             for token in model.stream_reply_text(
                 messages,
                 max_output_length=max_tokens,
+                speculator=speculator,
                 keychain=Keychain.init(turn_index + 1),
             ):
                 console.print(token, end="")
@@ -171,6 +187,7 @@ def chat(
     for token in model.stream_reply_text(
         [UserMessage(message)],
         max_output_length=max_tokens,
+        speculator=speculator,
         keychain=Keychain.init(1),
     ):
         console.print(token, end="")
