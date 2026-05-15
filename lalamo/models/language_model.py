@@ -438,7 +438,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
 
         decoding_keys = decoding_keychain.rolling_broadcast(
             (max_output_length, *decoding_keychain.vmapped_keys.shape),
-            mode=KeychainBroadcastMode.SUFFIX,
+            mode=KeychainBroadcastMode.PREFIX,
         ).vmapped_keys
         return DecodingSetup(
             initial_state=initial_state,
