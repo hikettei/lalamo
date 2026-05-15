@@ -386,13 +386,14 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
                 attention_parent_indices=proposal_inputs.attention_parent_indices,
                 keychain=Keychain(vmapped_keys=decoding_key, batch_key=decoding_keychain.batch_key),
             )
-            processed_tree_logits, sampled_token_ids = proposal.sample(
+            accepted = proposal.sample_and_verify(
                 decoder_result.logits,
                 state.sampling_policy,
                 current_output_lengths,
                 per_position_keys,
+                lm_state.root_sample_logits,
+                num_top_logits_to_return,
             )
-            accepted = proposal.verify(sampled_token_ids)
             emitted_token_ids = accepted.accepted_token_ids
             accepted, write_mask = accepted.truncate(
                 current_output_lengths,
@@ -400,19 +401,6 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
                 done,
                 eos_token_ids,
             )
-            accepted_token_logits = accepted.accepted_token_logits(
-                processed_tree_logits,
-                lm_state.root_sample_logits,
-            )
-
-            sampling_top_k_ids = None
-            sampling_top_k_logits = None
-            if num_top_logits_to_return is not None:
-                sampling_top_k_logits, sampling_top_k_ids = jax.lax.top_k(
-                    accepted_token_logits,
-                    num_top_logits_to_return,
-                )
-
             next_sampling_policy = call_vmapped(
                 lambda policy, row_token_ids, row_mask: policy.update_many(row_token_ids, row_mask),
                 state.sampling_policy,
@@ -422,11 +410,10 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             next_lm_state = lm_state.commit(
                 state_request,
                 decoder_result,
-                processed_tree_logits,
                 accepted,
                 emitted_token_ids,
-                sampling_top_k_ids=sampling_top_k_ids,
-                sampling_top_k_logits=sampling_top_k_logits,
+                sampling_top_k_ids=accepted.sampling_top_k_ids,
+                sampling_top_k_logits=accepted.sampling_top_k_logits,
             )
             return (
                 GenerationState(

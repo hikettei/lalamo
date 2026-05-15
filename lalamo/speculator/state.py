@@ -379,7 +379,6 @@ class LMState(eqx.Module):
         self,
         state_request: StateRequest,
         decoder_result: DecoderResult,
-        processed_tree_logits: Float[Array, "batch nodes vocabulary"],
         accepted: AcceptedProposal,
         emitted_token_ids: Int[Array, "batch max_slots"],
         *,
@@ -419,14 +418,10 @@ class LMState(eqx.Module):
             trace_top_k_logits=trace_top_k_logits,
             logsumexp=logsumexp,
         )
-        root_sample_logits = processed_tree_logits[
-            jnp.arange(accepted.terminal_node_indices.shape[0], dtype=jnp.int32),
-            accepted.terminal_node_indices,
-        ]
         return LMState(
             kv_cache=kv_cache,
             next_token_position=self.next_token_position + accepted.num_compact_indices,
             root_bonus_id=accepted.bonus_token_ids,
-            root_sample_logits=root_sample_logits,
+            root_sample_logits=accepted.terminal_sample_logits,
             memory=memory,
         )
