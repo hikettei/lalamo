@@ -80,7 +80,7 @@ class GenerationResults(NamedTuple):
     token_ids: Int[Array, "batch response_tokens"]
     top_k_token_ids: Int[Array, "batch response_tokens k"] | None
     top_k_token_logits: Float[Array, "batch response_tokens k"] | None
-    num_tokens_per_step: Int[Array, "batch steps"] | None
+    num_tokens_per_step: Int[Array, "steps batch"]
 
 
 @dataclass(frozen=True)
@@ -459,7 +459,6 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
         prefill_forward_pass_config: DecoderForwardPassConfig | None = None,
         decode_forward_pass_config: DecoderForwardPassConfig | None = None,
         speculator: Speculator | None = None,
-        return_num_tokens_per_step: bool = False,
         *,
         keychain: Keychain,
     ) -> GenerationResults:
@@ -521,9 +520,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             token_ids=token_ids,
             top_k_token_ids=top_k_token_ids,
             top_k_token_logits=top_k_token_logits,
-            num_tokens_per_step=(
-                rearrange(num_tokens_per_step, "step batch -> batch step") if return_num_tokens_per_step else None
-            ),
+            num_tokens_per_step=num_tokens_per_step,
         )
 
     def reply(

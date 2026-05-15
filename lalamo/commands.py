@@ -289,10 +289,8 @@ def evaluate_speculator(
             prompt_lengths_without_padding=warmup_lengths,
             max_output_length=max_output_length,
             speculator=speculator,
-            return_num_tokens_per_step=True,
             keychain=Keychain.init(seed + total_questions, shape=(warmup_batch_size,)),
         )
-        assert warmup_results.num_tokens_per_step is not None
         jax.device_get(warmup_results.num_tokens_per_step)
 
     by_category: dict[str, EvalCounts] = {}
@@ -309,14 +307,14 @@ def evaluate_speculator(
             prompt_lengths_without_padding=prompt_lengths_without_padding,
             max_output_length=max_output_length,
             speculator=speculator,
-            return_num_tokens_per_step=True,
             keychain=Keychain.init(seed + batch_start, shape=(current_batch_size,)),
         )
-        assert batch_results.num_tokens_per_step is not None
         counts = jax.device_get(batch_results.num_tokens_per_step)
-        for question, row_counts in zip(batch_questions, counts, strict=True):
-            tokens = int(row_counts.sum())
-            steps = int((row_counts > 0).sum())
+        token_counts = counts.sum(axis=0).tolist()
+        step_counts = (counts > 0).sum(axis=0).tolist()
+        for question, token_count, step_count in zip(batch_questions, token_counts, step_counts, strict=True):
+            tokens = int(token_count)
+            steps = int(step_count)
             by_category[question.category] = by_category.get(question.category, EvalCounts()).add(
                 tokens=tokens,
                 steps=steps,
