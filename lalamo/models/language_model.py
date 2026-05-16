@@ -25,7 +25,7 @@ from lalamo.modules.utils import call_vmapped
 from lalamo.sampling import SamplingPolicy
 from lalamo.speculator.common import NoSpeculator, Speculator
 from lalamo.speculator.proposal import AcceptedProposal
-from lalamo.speculator.state import LMState, MemoryBuffers, StateRequest
+from lalamo.speculator.state import LMState, MemoryBuffers, PrefillResults, StateRequest
 
 __all__ = [
     "ForwardPassConfig",
@@ -40,13 +40,6 @@ _COMPILED_PROMPT_LENGTHS = tuple(256 * 2**i for i in range(12))
 
 
 type ForwardPassConfig = DecoderForwardPassConfig
-
-
-class PrefillResults(NamedTuple):
-    last_token_logits: Float[Array, "batch vocabulary"]
-    last_token_indices: Int[Array, " batch"]
-    state: State
-    memory: MemoryBuffers
 
 
 class Chunk(eqx.Module):
@@ -64,16 +57,11 @@ class DecodingState(NamedTuple):
     sampling_policy: SamplingPolicy
 
 
-class GenerationState(NamedTuple):
-    sampling_policy: SamplingPolicy
-    lm_state: LMState
-
-
 class DecodingSetup(NamedTuple):
-    initial_state: GenerationState
+    initial_state: LMState
     decoding_keys: Key[Array, "steps ..."]
-    step: Callable[[GenerationState, Key[Array, "..."]], tuple[GenerationState, AcceptedProposal]]
-    is_done: Callable[[GenerationState], Bool[Array, " batch"]]
+    step: Callable[[LMState, Key[Array, "..."]], tuple[LMState, AcceptedProposal]]
+    is_done: Callable[[LMState], Bool[Array, " batch"]]
 
 
 class GenerationResults(NamedTuple):
@@ -333,24 +321,19 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             state_request=state_request,
             keychain=prefill_keychain,
         )
-        per_position_keys = sampling_keychain.rolling_broadcast(
-            (batch_size, max_output_length + 1),
+        sampling_keys = sampling_keychain.rolling_broadcast(
+            (batch_size,),
             mode=KeychainBroadcastMode.SUFFIX,
         ).vmapped_keys
         initial_lm_state = LMState.from_prefill(
             prefill_results,
             prompt_lengths_without_padding,
             sampling_policy,
-            per_position_keys[:, 0],
-        )
-        initial_state = GenerationState(
-            sampling_policy=sampling_policy,
-            lm_state=initial_lm_state,
+            sampling_keys,
         )
 
         def output_lengths(lm_state: LMState) -> Int[Array, " batch"]:
-            assert lm_state.memory.token_ids is not None
-            return lm_state.memory.token_ids.length - prompt_lengths_without_padding
+            return lm_state.output_lengths
 
         def stop_flags(lm_state: LMState) -> Bool[Array, " batch"]:
             if eos_token_ids.shape[0] == 0:
@@ -360,16 +343,15 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             eos_hits = jnp.any(token_ids[:, :, None] == eos_token_ids[None, None, :], axis=-1)
             return jnp.any(token_mask & eos_hits, axis=1)
 
-        def is_done(state: GenerationState) -> Bool[Array, " batch"]:
-            return stop_flags(state.lm_state) | (output_lengths(state.lm_state) >= max_output_length)
+        def is_done(lm_state: LMState) -> Bool[Array, " batch"]:
+            return stop_flags(lm_state) | (output_lengths(lm_state) >= max_output_length)
 
         def decode_step(
-            state: GenerationState,
+            lm_state: LMState,
             decoding_key: Key[Array, "..."],
-        ) -> tuple[GenerationState, AcceptedProposal]:
-            lm_state = state.lm_state
+        ) -> tuple[LMState, AcceptedProposal]:
             current_output_lengths = output_lengths(lm_state)
-            done = is_done(state)
+            done = is_done(lm_state)
             proposal = active_speculator.draft(lm_state)
             proposal_inputs = proposal.forward_inputs(lm_state.next_token_position)
             forward_pass_config = decode_forward_pass_config
@@ -386,15 +368,15 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
                 attention_parent_indices=proposal_inputs.attention_parent_indices,
                 keychain=Keychain(vmapped_keys=decoding_key, batch_key=decoding_keychain.batch_key),
             )
-            processed_tree_logits, sampled_token_ids = proposal.sample(
+            processed_tree_logits, sampled_token_ids, next_sampling_policies = proposal.sample(
                 decoder_result.logits,
-                state.sampling_policy,
-                current_output_lengths,
-                per_position_keys,
             )
-            accepted = proposal.verify(sampled_token_ids)
+            accepted = proposal.verify(
+                sampled_token_ids,
+                next_sampling_policies,
+            )
             emitted_token_ids = accepted.accepted_token_ids
-            accepted, write_mask = accepted.truncate(
+            accepted, _write_mask = accepted.truncate(
                 current_output_lengths,
                 max_output_length,
                 done,
@@ -413,12 +395,6 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
                     num_top_logits_to_return,
                 )
 
-            next_sampling_policy = call_vmapped(
-                lambda policy, row_token_ids, row_mask: policy.update_many(row_token_ids, row_mask),
-                state.sampling_policy,
-                emitted_token_ids,
-                write_mask,
-            )
             next_lm_state = lm_state.commit(
                 state_request,
                 decoder_result,
@@ -428,20 +404,14 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
                 sampling_top_k_ids=sampling_top_k_ids,
                 sampling_top_k_logits=sampling_top_k_logits,
             )
-            return (
-                GenerationState(
-                    sampling_policy=next_sampling_policy,
-                    lm_state=next_lm_state,
-                ),
-                accepted,
-            )
+            return next_lm_state, accepted
 
         decoding_keys = decoding_keychain.rolling_broadcast(
             (max_output_length, *decoding_keychain.vmapped_keys.shape),
             mode=KeychainBroadcastMode.PREFIX,
         ).vmapped_keys
         return DecodingSetup(
-            initial_state=initial_state,
+            initial_state=initial_lm_state,
             decoding_keys=decoding_keys,
             step=decode_step,
             is_done=is_done,
@@ -479,13 +449,13 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             prompt_lengths_without_padding = jnp.full((batch_size,), prompt_length, dtype=jnp.int32)
 
         def scan_step(
-            state: GenerationState,
+            state: LMState,
             decoding_key: Key[Array, "..."],
-        ) -> tuple[GenerationState, Int[Array, " batch"]]:
+        ) -> tuple[LMState, Int[Array, " batch"]]:
             def decode_step(
-                state: GenerationState,
+                state: LMState,
                 decoding_key: Key[Array, "..."],
-            ) -> tuple[GenerationState, Int[Array, " batch"]]:
+            ) -> tuple[LMState, Int[Array, " batch"]]:
                 next_state, accepted = setup.step(state, decoding_key)
                 return next_state, accepted.num_compact_indices
 
@@ -498,7 +468,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             )
 
         final_state, num_tokens_per_step = jax.lax.scan(scan_step, setup.initial_state, setup.decoding_keys)
-        memory = final_state.lm_state.memory
+        memory = final_state.memory
         assert memory.token_ids is not None
         token_ids, token_mask = memory.token_ids.window(prompt_lengths_without_padding, max_output_length)
         token_ids = jnp.where(token_mask, token_ids, jnp.zeros_like(token_ids))

@@ -5,7 +5,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
-from jaxtyping import Array, Bool, Float, Int
+from jaxtyping import Array, Bool, Float, Int, Key
 
 from lalamo.module import Keychain
 
@@ -155,80 +155,6 @@ class SamplingPolicy(eqx.Module):
         count = (jnp.asarray(should_count) & in_vocabulary).astype(jnp.int32)
         return replace(self, token_counts=self.token_counts.at[token_id].add(count))
 
-    def update_many(self, token_ids: Int[Array, " tokens"], mask: Bool[Array, " tokens"]) -> "SamplingPolicy":
-        def step(
-            policy: SamplingPolicy,
-            item: tuple[Int[Array, ""], Bool[Array, ""]],
-        ) -> tuple[SamplingPolicy, None]:
-            token_id, should_count = item
-            return policy.with_next_token_count(token_id, should_count), None
-
-        policy, _ = jax.lax.scan(step, self, (token_ids, mask))
-        return policy
-
-    def process_tree_logits(
-        self,
-        logits: Float[Array, "nodes vocabulary"],
-        token_ids: Int[Array, " nodes"],
-        parent_indices: Int[Array, " nodes"],
-        node_mask: Bool[Array, " nodes"],
-    ) -> Float[Array, "nodes vocabulary"]:
-        (num_nodes,) = token_ids.shape
-
-        def broadcast_policy(policy: SamplingPolicy) -> SamplingPolicy:
-            return jax.tree.map(
-                lambda value: jnp.broadcast_to(value, (num_nodes, *value.shape)) if eqx.is_array(value) else value,
-                policy,
-            )
-
-        def take_policy(policies: SamplingPolicy, index: Int[Array, ""]) -> SamplingPolicy:
-            return jax.tree.map(
-                lambda value: value[index] if eqx.is_array(value) and value.shape[0] == num_nodes else value,
-                policies,
-            )
-
-        def set_policy(
-            policies: SamplingPolicy,
-            index: Int[Array, ""],
-            policy: SamplingPolicy,
-        ) -> SamplingPolicy:
-            return jax.tree.map(
-                lambda values, value: values.at[index].set(value)
-                if eqx.is_array(values) and values.shape[0] == num_nodes
-                else values,
-                policies,
-                policy,
-            )
-
-        def step(
-            carry: tuple[SamplingPolicy, Float[Array, "nodes vocabulary"]],
-            node_index: Int[Array, ""],
-        ) -> tuple[tuple[SamplingPolicy, Float[Array, "nodes vocabulary"]], None]:
-            policies, processed_logits = carry
-            parent_index = parent_indices[node_index]
-            parent_policy = jax.lax.cond(
-                parent_index >= 0,
-                take_policy,
-                lambda *_: self,
-                policies,
-                parent_index,
-            )
-            node_policy = parent_policy.with_next_token_count(token_ids[node_index], node_mask[node_index])
-            row_logits = node_policy.process_logits(logits[node_index].astype(jnp.float32))
-            row_logits = jnp.where(node_mask[node_index], row_logits, jnp.zeros_like(row_logits))
-            return (
-                set_policy(policies, node_index, node_policy),
-                processed_logits.at[node_index].set(row_logits),
-            ), None
-
-        initial_logits = jnp.zeros_like(logits, dtype=jnp.float32)
-        (_, processed_logits), _ = jax.lax.scan(
-            step,
-            (broadcast_policy(self), initial_logits),
-            jnp.arange(num_nodes, dtype=jnp.int32),
-        )
-        return processed_logits
-
     def broadcast(self, batch_size: int) -> "SamplingPolicy":
         def broadcast_leaf(leaf: object) -> object:
             if isinstance(leaf, jax.Array):
@@ -247,6 +173,25 @@ class SamplingPolicy(eqx.Module):
         logits = self._apply_top_k(logits)
         logits = self._apply_top_p(logits)
         return self._apply_min_p(logits)
+
+    def sample(
+        self,
+        logits: Float[Array, " vocabulary"],
+        key: Key[Array, ""],
+        should_count: Bool[Array, ""] | bool = True,
+    ) -> tuple[Float[Array, " vocabulary"], Int[Array, ""], "SamplingPolicy"]:
+        processed_logits = self.process_logits(logits.astype(jnp.float32))
+        token_id = jax.random.categorical(key, processed_logits).astype(jnp.int32)
+        return processed_logits, token_id, self.with_next_token_count(token_id, should_count)
+
+    def sample_top_k(
+        self,
+        logits: Float[Array, " vocabulary"],
+        key: Key[Array, ""],
+        k: int,
+    ) -> Int[Array, " k"]:
+        processed_logits = self.process_logits(logits.astype(jnp.float32))
+        return jax.random.categorical(key, processed_logits, shape=(k,), replace=False).astype(jnp.int32)
 
     def __call__(self, logits: Float[Array, " vocabulary"], *, keychain: Keychain) -> Int[Array, ""]:
         self._raise_if_batched()
