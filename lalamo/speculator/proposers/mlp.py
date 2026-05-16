@@ -118,13 +118,15 @@ class MLPSpeculator(Speculator):
         proposal, frontier = state.create_root_proposal(budget=self.model.depth * width + 1)
 
         for depth_index in range(self.model.depth):
+            if proposal.num_nodes >= proposal.budget:
+                break
+            active_shape = frontier.node_indices.shape
             sampled = frontier.sample_top_k(
-                logits=logits[:, depth_index, :][:, None, :],
-                widths=jnp.full(frontier.node_indices.shape, width, dtype=jnp.int32),
+                logits=jnp.broadcast_to(logits[:, depth_index, :][:, None, :], (*active_shape, logits.shape[-1])),
+                widths=jnp.full(active_shape, width, dtype=jnp.int32),
                 max_width=width,
             )
             proposal, frontier = proposal.add_frontier(sampled)
-            frontier = frontier.take_rank(width, 0)
 
         return proposal
 

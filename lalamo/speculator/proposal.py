@@ -186,16 +186,6 @@ class Frontier(eqx.Module):
             ),
         )
 
-    def take_rank(self, max_width: int, rank: int) -> Frontier:
-        if rank < 0 or rank >= max_width:
-            raise ValueError("rank must fit within max_width.")
-        _, child_slots = self.node_indices.shape
-        if child_slots % max_width != 0:
-            raise ValueError("frontier active size must be divisible by max_width.")
-        parent_active = child_slots // max_width
-        active_indices = jnp.arange(parent_active, dtype=jnp.int32) * max_width + rank
-        return self.take(active_indices)
-
     def take(self, active_indices: Int[Array, " next_active"]) -> Frontier:
         return Frontier(
             node_indices=self.node_indices[:, active_indices],
@@ -288,12 +278,12 @@ class TrieProposal(eqx.Module):
         return self.token_ids.shape[1]
 
     def add_frontier(self, sampled: SampledFrontier) -> tuple[TrieProposal, Frontier]:
-        batch_size, active_size, width = sampled.token_ids.shape
+        batch_size, active_size, max_width = sampled.token_ids.shape
         if batch_size != self.batch_size:
             raise ValueError("sampled frontier batch size must match proposal batch size.")
-        child_slots = active_size * width
-        if self.num_nodes + child_slots > self.budget:
-            raise ValueError("sampled frontier does not fit in proposal budget.")
+        child_slots = active_size * max_width
+        remaining_slots = max(self.budget - self.num_nodes, 0)
+        slot_mask = jnp.arange(child_slots, dtype=jnp.int32) < remaining_slots
 
         child_node_indices = jnp.arange(self.num_nodes, self.num_nodes + child_slots, dtype=jnp.int32)
         batch_indices = jnp.arange(batch_size, dtype=jnp.int32)[:, None]
@@ -302,45 +292,51 @@ class TrieProposal(eqx.Module):
         parent_indices = sampled.parent_indices.reshape(batch_size, child_slots)
         depths = sampled.depths.reshape(batch_size, child_slots)
         gumbel_positions = sampled.gumbel_positions.reshape(batch_size, child_slots)
-        mask = sampled.mask.reshape(batch_size, child_slots)
+        mask = sampled.mask.reshape(batch_size, child_slots) & slot_mask[None, :]
         gumbel_node_ids = jnp.broadcast_to(node_indices, (batch_size, child_slots))
         sampling_policy = sampled.sampling_policy.reshape(
-            (batch_size, active_size, width),
+            (batch_size, active_size, max_width),
             (batch_size, child_slots),
         )
         sampling_policies = jax.tree.map(
             lambda values, updates: (
-                values.at[batch_indices, node_indices].set(updates) if eqx.is_array(values) else values
+                values.at[batch_indices, node_indices].set(updates, mode="drop") if eqx.is_array(values) else values
             ),
             self.sampling_policies,
             sampling_policy,
         )
         proposal = TrieProposal(
-            token_ids=self.token_ids.at[batch_indices, node_indices].set(jnp.where(mask, token_ids, 0)),
+            token_ids=self.token_ids.at[batch_indices, node_indices].set(
+                jnp.where(mask, token_ids, 0),
+                mode="drop",
+            ),
             parent_indices=self.parent_indices.at[batch_indices, node_indices].set(
                 jnp.where(mask, parent_indices, -1),
+                mode="drop",
             ),
-            depths=self.depths.at[batch_indices, node_indices].set(jnp.where(mask, depths, 0)),
+            depths=self.depths.at[batch_indices, node_indices].set(jnp.where(mask, depths, 0), mode="drop"),
             gumbel_positions=self.gumbel_positions.at[batch_indices, node_indices].set(
                 jnp.where(mask, gumbel_positions, 0),
+                mode="drop",
             ),
             gumbel_node_ids=self.gumbel_node_ids.at[batch_indices, node_indices].set(
                 jnp.where(mask, gumbel_node_ids, 0),
+                mode="drop",
             ),
-            node_mask=self.node_mask.at[batch_indices, node_indices].set(mask),
+            node_mask=self.node_mask.at[batch_indices, node_indices].set(mask, mode="drop"),
             sampling_policies=sampling_policies,
             gumbel_keys=self.gumbel_keys,
             vocabulary_size=self.vocabulary_size,
-            num_nodes=self.num_nodes + child_slots,
+            num_nodes=min(self.num_nodes + child_slots, self.budget),
             max_depth=self.max_depth + 1,
         )
         child_frontier = Frontier(
-            node_indices=jnp.broadcast_to(node_indices, (batch_size, child_slots)),
-            parent_indices=parent_indices,
-            token_ids=token_ids,
-            depths=depths,
-            gumbel_positions=gumbel_positions,
-            gumbel_node_ids=gumbel_node_ids,
+            node_indices=jnp.where(mask, jnp.broadcast_to(node_indices, (batch_size, child_slots)), 0),
+            parent_indices=jnp.where(mask, parent_indices, -1),
+            token_ids=jnp.where(mask, token_ids, 0),
+            depths=jnp.where(mask, depths, 0),
+            gumbel_positions=jnp.where(mask, gumbel_positions, 0),
+            gumbel_node_ids=jnp.where(mask, gumbel_node_ids, 0),
             mask=mask,
             sampling_policy=sampling_policy,
             gumbel_keys=self.gumbel_keys,

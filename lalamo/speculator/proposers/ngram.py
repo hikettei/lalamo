@@ -4,7 +4,7 @@ import struct
 from array import array
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from itertools import chain, repeat, tee
+from itertools import batched, chain, repeat, tee
 from math import exp, log
 from pathlib import Path
 from typing import Annotated, Any, Self
@@ -352,40 +352,54 @@ class NGramSpeculator(Speculator):
 
     def draft(self, state: LMState) -> TrieProposal:
         proposal, frontier = state.create_root_proposal(budget=self.width * self.depth + 1)
-        contexts = self.contexts(state)
+        contexts = [[context] for context in self.contexts(state)]
 
         for _ in range(self.depth):
-            row_probs = [self.model.probs(context) for context in contexts]
+            if proposal.num_nodes >= proposal.budget:
+                break
             vocab_size = self.vocab_size(state)
-            next_contexts = [list(context) for context in contexts]
-
             if vocab_size == 0:
                 break
 
-            frontier_mask = jax.device_get(frontier.mask[:, 0]).tolist()
+            max_width = min(self.width, vocab_size)
+            frontier_mask = jax.device_get(frontier.mask).tolist()
+            row_probs = [[self.model.probs(context) for context in row_contexts] for row_contexts in contexts]
             widths = jnp.asarray(
                 [
-                    min(self.width, sum(token_id < vocab_size for token_id in probs)) if active else 0
-                    for probs, active in zip(row_probs, frontier_mask, strict=True)
+                    [
+                        min(max_width, sum(token_id < vocab_size for token_id in probs)) if active else 0
+                        for probs, active in zip(row_probs_batch, frontier_mask_batch, strict=True)
+                    ]
+                    for row_probs_batch, frontier_mask_batch in zip(row_probs, frontier_mask, strict=True)
                 ],
                 dtype=jnp.int32,
             )
-            if not any(width > 0 for width in widths.tolist()):
+            if not any(width > 0 for row_widths in widths.tolist() for width in row_widths):
                 break
 
             sampled = frontier.sample_top_k(
-                logits=self.logits_for(row_probs, vocab_size)[:, None],
-                widths=widths[:, None],
-                max_width=min(self.width, vocab_size),
+                logits=self.logits_for_tree(row_probs, vocab_size),
+                widths=widths,
+                max_width=max_width,
             )
             proposal, frontier = proposal.add_frontier(sampled)
-            frontier = frontier.take_rank(min(self.width, vocab_size), 0)
-            node_token_ids = jax.device_get(frontier.token_ids[:, 0]).tolist()
-            node_mask = jax.device_get(frontier.mask[:, 0]).tolist()
-            for row_index, (token_id, valid) in enumerate(zip(node_token_ids, node_mask, strict=True)):
-                if valid:
-                    next_contexts[row_index].append(token_id)
-
+            node_token_ids = jax.device_get(frontier.token_ids).tolist()
+            node_mask = jax.device_get(frontier.mask).tolist()
+            next_contexts = []
+            for row_contexts, row_token_ids, row_mask in zip(contexts, node_token_ids, node_mask, strict=True):
+                next_row_contexts = []
+                for context, child_token_ids, child_mask in zip(
+                    row_contexts,
+                    batched(row_token_ids, max_width),
+                    batched(row_mask, max_width),
+                    strict=True,
+                ):
+                    for token_id, valid in zip(child_token_ids, child_mask, strict=True):
+                        next_context = list(context)
+                        if valid:
+                            next_context.append(token_id)
+                        next_row_contexts.append(next_context)
+                next_contexts.append(next_row_contexts)
             contexts = next_contexts
         return proposal
 
@@ -420,6 +434,9 @@ class NGramSpeculator(Speculator):
             )
             logits.append(row_logits)
         return jnp.stack(logits)
+
+    def logits_for_tree(self, rows: list[list[dict[int, float]]], vocab_size: int) -> jax.Array:
+        return jnp.stack([self.logits_for(row, vocab_size) for row in rows])
 
     def serialize(self) -> bytes:
         return self.model.serialize()
