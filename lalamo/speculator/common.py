@@ -44,7 +44,8 @@ class Speculator(ABC):
 
 class NoSpeculator(Speculator):
     def draft(self, state: LMState) -> TrieProposal:
-        return state.create_root_proposal(budget=1)
+        proposal, _frontier = state.create_root_proposal(budget=1)
+        return proposal
 
 
 class SpeculatorBackend[ConfigT](RegistryABC):

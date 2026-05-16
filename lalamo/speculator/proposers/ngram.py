@@ -351,46 +351,41 @@ class NGramSpeculator(Speculator):
         return StateRequest(token_id_capacity=max(self.model.max_order - 1, 0))
 
     def draft(self, state: LMState) -> TrieProposal:
-        proposal = state.create_root_proposal(budget=self.width * self.depth + 1)
-        batch_size = state.root_bonus_id.shape[0]
-        parent_indices = [0 for _ in range(batch_size)]
+        proposal, frontier = state.create_root_proposal(budget=self.width * self.depth + 1)
         contexts = self.contexts(state)
 
         for _ in range(self.depth):
             row_probs = [self.model.probs(context) for context in contexts]
             vocab_size = self.vocab_size(state)
-            next_parent_indices = list(parent_indices)
             next_contexts = [list(context) for context in contexts]
 
             if vocab_size == 0:
                 break
 
-            for rank in range(self.width):
-                batch_indices = [
-                    row_index for row_index, probs in enumerate(row_probs) if self.has_token(probs, vocab_size)
-                ]
-                if not batch_indices:
-                    break
+            frontier_mask = jax.device_get(frontier.mask[:, 0]).tolist()
+            widths = jnp.asarray(
+                [
+                    min(self.width, sum(token_id < vocab_size for token_id in probs)) if active else 0
+                    for probs, active in zip(row_probs, frontier_mask, strict=True)
+                ],
+                dtype=jnp.int32,
+            )
+            if not any(width > 0 for width in widths.tolist()):
+                break
 
-                batch_indices_array = jnp.asarray(batch_indices, dtype=jnp.int32)
-                logits = self.logits_for([row_probs[row_index] for row_index in batch_indices], vocab_size)
-                proposal, node_index = proposal.add_nodes(
-                    batch_indices=batch_indices_array,
-                    parent_indices=jnp.asarray(
-                        [parent_indices[row_index] for row_index in batch_indices], dtype=jnp.int32
-                    ),
-                    logits=logits,
-                )
-                node_token_ids = jax.device_get(proposal.token_ids[batch_indices_array, node_index]).tolist()
-                for row_index, token_id in zip(batch_indices, node_token_ids, strict=True):
-                    row_probs[row_index].pop(token_id, None)
+            sampled = frontier.sample_top_k(
+                logits=self.logits_for(row_probs, vocab_size)[:, None],
+                widths=widths[:, None],
+                max_width=min(self.width, vocab_size),
+            )
+            proposal, frontier = proposal.add_frontier(sampled)
+            frontier = frontier.take_rank(min(self.width, vocab_size), 0)
+            node_token_ids = jax.device_get(frontier.token_ids[:, 0]).tolist()
+            node_mask = jax.device_get(frontier.mask[:, 0]).tolist()
+            for row_index, (token_id, valid) in enumerate(zip(node_token_ids, node_mask, strict=True)):
+                if valid:
+                    next_contexts[row_index].append(token_id)
 
-                if rank == 0:
-                    for row_index, token_id in zip(batch_indices, node_token_ids, strict=True):
-                        next_parent_indices[row_index] = node_index
-                        next_contexts[row_index].append(token_id)
-
-            parent_indices = next_parent_indices
             contexts = next_contexts
         return proposal
 

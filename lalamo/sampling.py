@@ -163,6 +163,20 @@ class SamplingPolicy(eqx.Module):
 
         return jax.tree.map(broadcast_leaf, self)
 
+    def reshape(
+        self,
+        old_leading_shape: tuple[int, ...],
+        new_leading_shape: tuple[int, ...],
+    ) -> "SamplingPolicy":
+        return jax.tree.map(
+            lambda value: (
+                value.reshape((*new_leading_shape, *value.shape[len(old_leading_shape) :]))
+                if eqx.is_array(value)
+                else value
+            ),
+            self,
+        )
+
     def process_logits(self, logits: Float[Array, " vocabulary"]) -> Float[Array, " vocabulary"]:
         self._raise_if_batched()
         logits = self._apply_banned_tokens(logits)

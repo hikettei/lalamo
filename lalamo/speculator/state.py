@@ -11,7 +11,7 @@ from lalamo.modules.token_mixer import State
 from lalamo.modules.token_mixers.kv_cache import StaticKVCacheLayer, compact_state_layers
 from lalamo.modules.utils import call_vmapped
 from lalamo.sampling import SamplingPolicy
-from lalamo.speculator.proposal import AcceptedProposal, TrieProposal
+from lalamo.speculator.proposal import AcceptedProposal, Frontier, TrieProposal
 
 __all__ = [
     "LMState",
@@ -349,10 +349,10 @@ class LMState(eqx.Module):
             memory=prefill_results.memory,
         )
 
-    def create_root_proposal(self, budget: int = 128) -> TrieProposal:
+    def create_root_proposal(self, budget: int = 128) -> tuple[TrieProposal, Frontier]:
         return TrieProposal.create(
             root_ids=self.root_bonus_id,
-            root_sample_positions=self.next_token_position + 1,
+            root_gumbel_positions=self.next_token_position + 1,
             sampling_policy=self.sampling_policy,
             gumbel_keys=self.gumbel_keys,
             vocabulary_size=self.root_sample_logits.shape[-1],
