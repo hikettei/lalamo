@@ -5,10 +5,11 @@ from array import array
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from itertools import chain, repeat, tee
-from math import exp
+from math import exp, log
 from pathlib import Path
 from typing import Annotated, Any, Self
 
+import jax
 import jax.numpy as jnp
 import xxhash
 from typer import Option
@@ -351,35 +352,46 @@ class NGramSpeculator(Speculator):
 
     def draft(self, state: LMState) -> TrieProposal:
         proposal = state.create_root_proposal(budget=self.width * self.depth + 1)
-        parent_indices = [0 for _ in range(state.root_bonus_id.shape[0])]
+        batch_size = state.root_bonus_id.shape[0]
+        parent_indices = [0 for _ in range(batch_size)]
         contexts = self.contexts(state)
 
         for _ in range(self.depth):
-            candidates = [self.rank_candidates(context) for context in contexts]
-            if all(not row_candidates for row_candidates in candidates):
+            row_probs = [self.model.probs(context) for context in contexts]
+            vocab_size = self.vocab_size(state)
+            next_parent_indices = list(parent_indices)
+            next_contexts = [list(context) for context in contexts]
+
+            if vocab_size == 0:
                 break
 
             for rank in range(self.width):
                 batch_indices = [
-                    row_index for row_index, row_candidates in enumerate(candidates) if rank < len(row_candidates)
+                    row_index for row_index, probs in enumerate(row_probs) if self.has_token(probs, vocab_size)
                 ]
                 if not batch_indices:
-                    continue
+                    break
 
-                node_token_ids = [candidates[row_index][rank] for row_index in batch_indices]
+                batch_indices_array = jnp.asarray(batch_indices, dtype=jnp.int32)
+                logits = self.logits_for([row_probs[row_index] for row_index in batch_indices], vocab_size)
                 proposal, node_index = proposal.add_nodes(
-                    batch_indices=jnp.asarray(batch_indices, dtype=jnp.int32),
+                    batch_indices=batch_indices_array,
                     parent_indices=jnp.asarray(
                         [parent_indices[row_index] for row_index in batch_indices], dtype=jnp.int32
                     ),
-                    token_ids=jnp.asarray(node_token_ids, dtype=jnp.int32),
+                    logits=logits,
                 )
+                node_token_ids = jax.device_get(proposal.token_ids[batch_indices_array, node_index]).tolist()
+                for row_index, token_id in zip(batch_indices, node_token_ids, strict=True):
+                    row_probs[row_index].pop(token_id, None)
 
                 if rank == 0:
                     for row_index, token_id in zip(batch_indices, node_token_ids, strict=True):
-                        parent_indices[row_index] = node_index
-                        contexts[row_index].append(token_id)
+                        next_parent_indices[row_index] = node_index
+                        next_contexts[row_index].append(token_id)
 
+            parent_indices = next_parent_indices
+            contexts = next_contexts
         return proposal
 
     def contexts(self, state: LMState) -> list[list[int]]:
@@ -397,11 +409,22 @@ class NGramSpeculator(Speculator):
             )
         ]
 
-    def rank_candidates(self, context: Iterable[int]) -> tuple[int, ...]:
-        probs = self.model.probs(context)
-        return tuple(
-            token_id for token_id, _ in sorted(probs.items(), key=lambda item: (-item[1], item[0]))[: self.width]
-        )
+    def vocab_size(self, state: LMState) -> int:
+        return state.root_sample_logits.shape[-1]
+
+    def has_token(self, probs: dict[int, float], vocab_size: int) -> bool:
+        return any(token_id < vocab_size for token_id in probs)
+
+    def logits_for(self, rows: list[dict[int, float]], vocab_size: int) -> jax.Array:
+        logits = []
+        for probs in rows:
+            token_ids = [token_id for token_id in probs if token_id < vocab_size]
+            row_logits = jnp.full((vocab_size,), -jnp.inf, dtype=jnp.float32)
+            row_logits = row_logits.at[jnp.asarray(token_ids, dtype=jnp.int32)].set(
+                jnp.asarray([log(probs[token_id]) for token_id in token_ids], dtype=jnp.float32),
+            )
+            logits.append(row_logits)
+        return jnp.stack(logits)
 
     def serialize(self) -> bytes:
         return self.model.serialize()

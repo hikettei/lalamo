@@ -115,22 +115,13 @@ class MLPSpeculator(Speculator):
         output_norm, _ = state.recent_output_norm(1)
         logits = self.model(output_norm[:, -1])
         width = min(self.width, logits.shape[-1])
-        token_ids = jax.lax.top_k(logits, width)[1]
         proposal = state.create_root_proposal(budget=self.model.depth * width + 1)
-        batch_indices = jnp.arange(state.root_bonus_id.shape[0], dtype=jnp.int32)
-        parent_indices = jnp.zeros((state.root_bonus_id.shape[0],), dtype=jnp.int32)
 
         for depth_index in range(self.model.depth):
-            next_parent_indices = parent_indices
-            for rank in range(width):
-                proposal, node_index = proposal.add_nodes(
-                    batch_indices=batch_indices,
-                    parent_indices=parent_indices,
-                    token_ids=token_ids[:, depth_index, rank],
-                )
-                if rank == 0:
-                    next_parent_indices = jnp.full(parent_indices.shape, node_index, dtype=jnp.int32)
-            parent_indices = next_parent_indices
+            proposal, _node_index = proposal.add_nodes(
+                logits=logits[:, depth_index],
+                width=width,
+            )
 
         return proposal
 
