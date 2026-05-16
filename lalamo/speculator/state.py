@@ -1,4 +1,4 @@
-from typing import Annotated, Any
+from typing import Annotated, NamedTuple
 
 import equinox as eqx
 import jax
@@ -9,12 +9,14 @@ from jaxtyping import Array, Bool, DTypeLike, Float, Int, Key
 from lalamo.modules.decoder import DecoderActivationTrace, DecoderResult
 from lalamo.modules.token_mixer import State
 from lalamo.modules.token_mixers.kv_cache import StaticKVCacheLayer, compact_state_layers
+from lalamo.modules.utils import call_vmapped
 from lalamo.sampling import SamplingPolicy
 from lalamo.speculator.proposal import AcceptedProposal, TrieProposal
 
 __all__ = [
     "LMState",
     "MemoryBuffers",
+    "PrefillResults",
     "RingBuffer",
     "StateRequest",
 ]
@@ -255,60 +257,39 @@ class MemoryBuffers(eqx.Module):
             batch_indices = jnp.arange(compact_indices.shape[0], dtype=jnp.int32)[:, None]
             return values[batch_indices, row_indices]
 
-        token_ids = self.token_ids
-        if token_ids is not None:
-            token_ids = token_ids.append(emitted_token_ids, num_compact_indices)
+        def append_buffer(buffer: RingBuffer | None, rows: Array | None) -> RingBuffer | None:
+            if buffer is None:
+                return None
+            assert rows is not None
+            return buffer.append(rows.astype(buffer.values.dtype), num_compact_indices)
 
-        next_sampling_top_k_ids = self.sampling_top_k_ids
-        if next_sampling_top_k_ids is not None:
-            assert sampling_top_k_ids is not None
-            next_sampling_top_k_ids = next_sampling_top_k_ids.append(sampling_top_k_ids, num_compact_indices)
-
-        next_sampling_top_k_logits = self.sampling_top_k_logits
-        if next_sampling_top_k_logits is not None:
-            assert sampling_top_k_logits is not None
-            next_sampling_top_k_logits = next_sampling_top_k_logits.append(sampling_top_k_logits, num_compact_indices)
-
-        next_trace_top_k_ids = self.trace_top_k_ids
-        if next_trace_top_k_ids is not None:
-            assert trace_top_k_ids is not None
-            next_trace_top_k_ids = next_trace_top_k_ids.append(trace_top_k_ids, num_compact_indices)
-
-        next_trace_top_k_logits = self.trace_top_k_logits
-        if next_trace_top_k_logits is not None:
-            assert trace_top_k_logits is not None
-            next_trace_top_k_logits = next_trace_top_k_logits.append(
-                trace_top_k_logits.astype(jnp.bfloat16),
-                num_compact_indices,
-            )
-
-        next_logsumexp = self.logsumexp
-        if next_logsumexp is not None:
-            assert logsumexp is not None
-            next_logsumexp = next_logsumexp.append(logsumexp, num_compact_indices)
+        token_ids = append_buffer(self.token_ids, emitted_token_ids)
+        next_sampling_top_k_ids = append_buffer(self.sampling_top_k_ids, sampling_top_k_ids)
+        next_sampling_top_k_logits = append_buffer(self.sampling_top_k_logits, sampling_top_k_logits)
+        next_trace_top_k_ids = append_buffer(self.trace_top_k_ids, trace_top_k_ids)
+        next_trace_top_k_logits = append_buffer(self.trace_top_k_logits, trace_top_k_logits)
+        next_logsumexp = append_buffer(self.logsumexp, logsumexp)
 
         output_norm = self.output_norm
-        if output_norm is not None:
-            assert activation_trace is not None
-            output_norm = output_norm.append(
-                compact_rows(activation_trace.output_norm).astype(jnp.bfloat16),
-                num_compact_indices,
-            )
-
         layer_outputs = self.layer_outputs
-        if layer_outputs:
+        if output_norm is not None or layer_outputs:
             assert activation_trace is not None
-            layer_outputs = tuple(
-                previous_layer_output.append(
-                    compact_rows(activation_trace.layer_results[layer_index].outputs).astype(jnp.bfloat16),
-                    num_compact_indices,
-                )
+            if output_norm is not None:
+                output_norm = append_buffer(output_norm, compact_rows(activation_trace.output_norm))
+            if layer_outputs:
+                next_layer_outputs = []
                 for previous_layer_output, layer_index in zip(
                     layer_outputs,
                     state_request.layer_indices,
                     strict=True,
-                )
-            )
+                ):
+                    next_layer_output = append_buffer(
+                        previous_layer_output,
+                        compact_rows(activation_trace.layer_results[layer_index].outputs),
+                    )
+                    assert next_layer_output is not None
+                    next_layer_outputs.append(next_layer_output)
+                layer_outputs = tuple(next_layer_outputs)
 
         return MemoryBuffers(
             token_ids=token_ids,
@@ -322,31 +303,49 @@ class MemoryBuffers(eqx.Module):
         )
 
 
+class PrefillResults(NamedTuple):
+    last_token_logits: Float[Array, "batch vocabulary"]
+    last_token_indices: Int[Array, " batch"]
+    state: State
+    memory: MemoryBuffers
+
+
 class LMState(eqx.Module):
     kv_cache: State
     next_token_position: Int[Array, " batch"]
     root_bonus_id: Int[Array, " batch"]
     root_sample_logits: Float[Array, "batch vocabulary"]
+    sampling_policy: SamplingPolicy
+    gumbel_keys: Key[Array, " batch"]
+    output_lengths: Int[Array, " batch"]
     memory: MemoryBuffers
 
     @classmethod
     def from_prefill(
         cls,
-        prefill_results: Any,  # noqa: ANN401
+        prefill_results: PrefillResults,
         next_token_position: Int[Array, " batch"],
         sampling_policy: SamplingPolicy,
-        root_sample_keys: Key[Array, " batch"],
+        gumbel_keys: Key[Array, " batch"],
     ) -> "LMState":
-        root_sample_logits = jax.vmap(lambda policy, logits: policy.process_logits(logits.astype(jnp.float32)))(
+        root_sample_logits, root_bonus_id, next_sampling_policy = call_vmapped(
+            lambda policy, key, position, logits: policy.sample(
+                logits,
+                jax.random.fold_in(key, position.astype(jnp.int32)),
+            ),
             sampling_policy,
+            gumbel_keys,
+            next_token_position,
             prefill_results.last_token_logits,
         )
-        root_bonus_id = jax.vmap(jax.random.categorical)(root_sample_keys, root_sample_logits).astype(jnp.int32)
         return cls(
             kv_cache=prefill_results.state,
             next_token_position=next_token_position,
             root_bonus_id=root_bonus_id,
             root_sample_logits=root_sample_logits,
+            sampling_policy=next_sampling_policy,
+            gumbel_keys=gumbel_keys,
+            output_lengths=jnp.zeros(next_token_position.shape, dtype=jnp.int32),
             memory=prefill_results.memory,
         )
 
@@ -354,6 +353,9 @@ class LMState(eqx.Module):
         return TrieProposal.create(
             root_ids=self.root_bonus_id,
             root_sample_positions=self.next_token_position + 1,
+            sampling_policy=self.sampling_policy,
+            gumbel_keys=self.gumbel_keys,
+            vocabulary_size=self.root_sample_logits.shape[-1],
             budget=budget,
         )
 
@@ -428,5 +430,8 @@ class LMState(eqx.Module):
             next_token_position=self.next_token_position + accepted.num_compact_indices,
             root_bonus_id=accepted.bonus_token_ids,
             root_sample_logits=root_sample_logits,
+            sampling_policy=accepted.next_sampling_policy,
+            gumbel_keys=self.gumbel_keys,
+            output_lengths=self.output_lengths + accepted.num_compact_indices,
             memory=memory,
         )
