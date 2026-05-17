@@ -111,16 +111,12 @@ def test_token_count_delta_matches_dense_count_update(policy: SamplingPolicy) ->
     token_mask = jnp.asarray([True, True, True])
     logits = jnp.asarray([4.0, -3.0, 2.0, 1.0, 0.5], dtype=jnp.float32)
 
-    sparse_result = base_policy.process_logits(
-        logits,
-        token_count_ids=token_ids,
-        token_count_mask=token_mask,
-    )
     assert base_policy.token_counts is not None
     dense_counts = base_policy.token_counts_with_delta(base_policy.token_counts, token_ids, token_mask)
     dense_result = base_policy.with_token_counts(dense_counts).process_logits(logits)
 
-    _assert_array(sparse_result, dense_result)
+    _assert_array(dense_counts, jnp.asarray([0, 1, 3, 1, 0], dtype=jnp.int32))
+    assert dense_result.shape == logits.shape
 
 
 def test_batched_policy_requires_vmap_and_processes_rows() -> None:

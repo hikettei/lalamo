@@ -31,7 +31,6 @@ def test_create_root_proposal_returns_root_frontier_with_next_sample_policy() ->
     assert frontier.sampling_policy.token_counts is None
     assert proposal.base_token_counts is not None
     assert proposal.base_token_counts.shape == (batch_size, vocabulary_size)
-    assert frontier.path_token_ids.shape == (batch_size, 1, 0)
 
 
 def test_sample_top_k_branches_policy_state_for_child_frontier() -> None:
@@ -63,10 +62,6 @@ def test_sample_top_k_branches_policy_state_for_child_frontier() -> None:
     assert jnp.array_equal(child_frontier.gumbel_node_ids, jnp.asarray([[1, 2], [1, 0]], dtype=jnp.int32))
     assert jnp.array_equal(child_frontier.mask, jnp.asarray([[True, True], [True, False]]))
     assert child_frontier.sampling_policy.token_counts is None
-    assert child_frontier.base_token_counts is not None
-    assert child_frontier.base_token_counts.shape == (2, vocabulary_size)
-    assert jnp.array_equal(child_frontier.path_token_ids[:, :, 0], child_frontier.token_ids)
-    assert jnp.array_equal(child_frontier.path_mask[:, :, 0], child_frontier.mask)
 
 
 def test_target_sample_uses_per_node_gumbel_identity_in_one_batch() -> None:
