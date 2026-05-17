@@ -188,18 +188,6 @@ class SamplingPolicy(eqx.Module):
         logits = self._apply_top_p(logits)
         return self._apply_min_p(logits)
 
-    def process_candidate_logits(
-        self,
-        candidate_ids: Int[Array, " candidates"],
-        logits: Float[Array, " candidates"],
-    ) -> Float[Array, " candidates"]:
-        self._raise_if_candidate_policy_is_batched()
-        logits = self._apply_candidate_banned_tokens(candidate_ids, logits.astype(jnp.float32))
-        logits = self._apply_candidate_temperature(logits)
-        logits = self._apply_candidate_top_k(logits)
-        logits = self._apply_candidate_top_p(logits)
-        return self._apply_candidate_min_p(logits)
-
     def broadcast(self, batch_size: int) -> "SamplingPolicy":
         def broadcast_leaf(leaf: object) -> object:
             if isinstance(leaf, jax.Array):
@@ -267,21 +255,6 @@ class SamplingPolicy(eqx.Module):
                 "Attempted to call a method on a batched version of SamplingPolicy. Use vmap instead.",
             )
 
-    def _raise_if_candidate_policy_is_batched(self) -> None:
-        scalar_fields: tuple[SamplingLeaf | None, ...] = (
-            self.temperature,
-            self.top_k,
-            self.top_p,
-            self.min_p,
-        )
-        vector_fields: tuple[SamplingLeaf | None, ...] = (self.banned_tokens,)
-        if any(field is not None and field.ndim != 0 for field in scalar_fields) or any(
-            field is not None and field.ndim != 1 for field in vector_fields
-        ):
-            raise ValueError(
-                "Attempted to call a method on a batched version of SamplingPolicy. Use vmap instead.",
-            )
-
     def _apply_banned_tokens(self, logits: Float[Array, " vocabulary"]) -> Float[Array, " vocabulary"]:
         if self.banned_tokens is None:
             return logits
@@ -310,64 +283,6 @@ class SamplingPolicy(eqx.Module):
             logits = logits - self.frequency_penalty * self.token_counts.astype(logits.dtype)
 
         return logits
-
-    def _apply_candidate_banned_tokens(
-        self,
-        candidate_ids: Int[Array, " candidates"],
-        logits: Float[Array, " candidates"],
-    ) -> Float[Array, " candidates"]:
-        if self.banned_tokens is None:
-            return logits
-        banned = jnp.any(self.banned_tokens[:, None] == candidate_ids[None, :], axis=0)
-        return jnp.where(banned, -jnp.inf, logits)
-
-    def _apply_candidate_temperature(self, logits: Float[Array, " candidates"]) -> Float[Array, " candidates"]:
-        if self.temperature is None:
-            return logits
-        best_index = jnp.argmax(logits, axis=-1)
-        greedy_logits = jnp.where(jnp.arange(logits.shape[0]) == best_index, 1.0, -jnp.inf)
-        return jnp.where(
-            self.temperature == 0.0,
-            greedy_logits,
-            logits / jnp.where(self.temperature == 0.0, 1.0, self.temperature),
-        )
-
-    def _apply_candidate_top_k(self, logits: Float[Array, " candidates"]) -> Float[Array, " candidates"]:
-        if self.top_k is None:
-            return logits
-        candidate_count = logits.shape[0]
-        effective_top_k = jnp.clip(self.top_k, 1, candidate_count)
-        if self.top_k_limit is None:
-            sorted_logits = jnp.sort(logits, axis=-1, descending=True)
-            min_logit = sorted_logits[effective_top_k - 1]
-        else:
-            top_values, _top_indices = jax.lax.top_k(logits, min(self.top_k_limit, candidate_count))
-            min_logit = top_values[effective_top_k - 1]
-        filtered_logits = jnp.where(logits >= min_logit, logits, -jnp.inf)
-        return jnp.where(self.top_k > 0, filtered_logits, logits)
-
-    def _apply_candidate_top_p(self, logits: Float[Array, " candidates"]) -> Float[Array, " candidates"]:
-        if self.top_p is None:
-            return logits
-        if self.top_k_limit is not None:
-            return self._apply_top_p_inside_static_top_k(logits)
-        sorted_indices = jnp.argsort(logits, axis=-1, descending=True)
-        sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)
-        cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits, axis=-1), axis=-1)
-        to_remove_sorted = cumulative_probs > self.top_p
-        to_remove_sorted = jnp.roll(to_remove_sorted, shift=1, axis=-1)
-        to_remove_sorted = to_remove_sorted.at[0].set(False)
-        unsort_indices = jnp.argsort(sorted_indices, axis=-1)
-        to_remove_unsorted = jnp.take_along_axis(to_remove_sorted, unsort_indices, axis=-1)
-        return jnp.where(to_remove_unsorted, -jnp.inf, logits)
-
-    def _apply_candidate_min_p(self, logits: Float[Array, " candidates"]) -> Float[Array, " candidates"]:
-        if self.min_p is None:
-            return logits
-        max_logit = jnp.max(logits)
-        logit_cutoff = max_logit + jnp.log(self.min_p)
-        filtered_logits = jnp.where(logits >= logit_cutoff, logits, -jnp.inf)
-        return jnp.where(self.min_p == 0.0, logits, filtered_logits)
 
     def _apply_temperature(self, logits: Float[Array, " vocabulary"]) -> Float[Array, " vocabulary"]:
         if self.temperature is None:
