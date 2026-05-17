@@ -633,7 +633,7 @@ def print_speculator_eval_results(results: EvalResults) -> None:
     table.add_column("Category", justify="right")
     table.add_column("tok/step", justify="right")
     table.add_column("tok/sec", justify="right")
-    table.add_column("draft_acc", justify="right")
+    table.add_column("mal", justify="right")
     table.add_column("spec_rate", justify="right")
     table.add_column("questions", justify="right")
 
