@@ -96,6 +96,33 @@ def test_token_counts_ignore_out_of_vocab_tokens_and_update_generated_tokens() -
     )
 
 
+@pytest.mark.parametrize(
+    "policy",
+    [
+        SamplingPolicy.init(repetition_penalty=2.0),
+        SamplingPolicy.init(presence_penalty=0.5),
+        SamplingPolicy.init(frequency_penalty=0.5),
+        SamplingPolicy.init(repetition_penalty=2.0, presence_penalty=0.5, frequency_penalty=0.25),
+    ],
+)
+def test_token_count_delta_matches_dense_count_update(policy: SamplingPolicy) -> None:
+    base_policy = _with_counts(policy, (1, 2), 2, 5)
+    token_ids = jnp.asarray([2, 2, 3], dtype=jnp.int32)
+    token_mask = jnp.asarray([True, True, True])
+    logits = jnp.asarray([4.0, -3.0, 2.0, 1.0, 0.5], dtype=jnp.float32)
+
+    sparse_result = base_policy.process_logits(
+        logits,
+        token_count_ids=token_ids,
+        token_count_mask=token_mask,
+    )
+    assert base_policy.token_counts is not None
+    dense_counts = base_policy.token_counts_with_delta(base_policy.token_counts, token_ids, token_mask)
+    dense_result = base_policy.with_token_counts(dense_counts).process_logits(logits)
+
+    _assert_array(sparse_result, dense_result)
+
+
 def test_batched_policy_requires_vmap_and_processes_rows() -> None:
     policy = SamplingPolicy.init_batch(
         temperature=(0.0, 1.0),

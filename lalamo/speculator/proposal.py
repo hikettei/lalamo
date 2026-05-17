@@ -91,6 +91,8 @@ class SampledFrontier(eqx.Module):
     gumbel_positions: Int[Array, "batch active width"]
     mask: Bool[Array, "batch active width"]
     sampling_policy: SamplingPolicy
+    path_token_ids: Int[Array, "batch active width depth"]
+    path_mask: Bool[Array, "batch active width depth"]
 
 
 class Frontier(eqx.Module):
@@ -102,6 +104,9 @@ class Frontier(eqx.Module):
     gumbel_node_ids: Int[Array, "batch active"]
     mask: Bool[Array, "batch active"]
     sampling_policy: SamplingPolicy
+    base_token_counts: Int[Array, "batch vocabulary"] | None
+    path_token_ids: Int[Array, "batch active depth"]
+    path_mask: Bool[Array, "batch active depth"]
     gumbel_keys: Key[Array, " batch"]
 
     def sample_one(self, logits: Float[Array, "batch active vocabulary"]) -> TargetSample:
@@ -109,27 +114,71 @@ class Frontier(eqx.Module):
         if self.node_indices.shape != (batch_size, active_size):
             raise ValueError("logits leading dimensions must match frontier shape.")
 
-        flat_policy = self.sampling_policy.reshape((batch_size, active_size), (batch_size * active_size,))
-        flat_keys = jnp.broadcast_to(self.gumbel_keys[:, None], (batch_size, active_size)).reshape(
-            batch_size * active_size,
-        )
-        flat_positions = self.gumbel_positions.reshape(batch_size * active_size)
-        flat_node_ids = self.gumbel_node_ids.reshape(batch_size * active_size)
-        flat_logits = logits.reshape(batch_size * active_size, vocabulary_size)
-        flat_mask = self.mask.reshape(batch_size * active_size)
+        if self.base_token_counts is None:
+            flat_policy = self.sampling_policy.reshape((batch_size, active_size), (batch_size * active_size,))
+            flat_keys = jnp.broadcast_to(self.gumbel_keys[:, None], (batch_size, active_size)).reshape(
+                batch_size * active_size,
+            )
+            flat_positions = self.gumbel_positions.reshape(batch_size * active_size)
+            flat_node_ids = self.gumbel_node_ids.reshape(batch_size * active_size)
+            flat_logits = logits.reshape(batch_size * active_size, vocabulary_size)
+            flat_mask = self.mask.reshape(batch_size * active_size)
+            processed_logits, token_ids, next_policy = jax.vmap(sample_one_with_policy)(
+                flat_policy,
+                flat_logits,
+                flat_keys,
+                flat_positions,
+                flat_node_ids,
+                flat_mask,
+            )
+            return TargetSample(
+                processed_logits=processed_logits.reshape(batch_size, active_size, vocabulary_size),
+                token_ids=token_ids.reshape(batch_size, active_size),
+                next_sampling_policy=next_policy.reshape((batch_size * active_size,), (batch_size, active_size)),
+                mask=self.mask,
+            )
 
-        processed_logits, token_ids, next_policy = jax.vmap(sample_one_with_policy)(
-            flat_policy,
-            flat_logits,
-            flat_keys,
-            flat_positions,
-            flat_node_ids,
-            flat_mask,
+        def sample_batch(
+            policy: SamplingPolicy,
+            batch_base_token_counts: Int[Array, " count_vocabulary"],
+            batch_path_token_ids: Int[Array, "active depth"],
+            batch_path_mask: Bool[Array, "active depth"],
+            batch_logits: Float[Array, "active vocabulary"],
+            batch_key: Key[Array, ""],
+            batch_gumbel_positions: Int[Array, " active"],
+            batch_gumbel_node_ids: Int[Array, " active"],
+            batch_mask: Bool[Array, " active"],
+        ) -> tuple[Float[Array, "active vocabulary"], Int[Array, " active"], SamplingPolicy]:
+            return jax.vmap(
+                sample_one_with_count_delta,
+                in_axes=(0, None, 0, 0, 0, None, 0, 0, 0),
+            )(
+                policy,
+                batch_base_token_counts,
+                batch_path_token_ids,
+                batch_path_mask,
+                batch_logits,
+                batch_key,
+                batch_gumbel_positions,
+                batch_gumbel_node_ids,
+                batch_mask,
+            )
+
+        processed_logits, token_ids, next_policy = jax.vmap(sample_batch)(
+            self.sampling_policy,
+            self.base_token_counts,
+            self.path_token_ids,
+            self.path_mask,
+            logits,
+            self.gumbel_keys,
+            self.gumbel_positions,
+            self.gumbel_node_ids,
+            self.mask,
         )
         return TargetSample(
-            processed_logits=processed_logits.reshape(batch_size, active_size, vocabulary_size),
-            token_ids=token_ids.reshape(batch_size, active_size),
-            next_sampling_policy=next_policy.reshape((batch_size * active_size,), (batch_size, active_size)),
+            processed_logits=processed_logits,
+            token_ids=token_ids,
+            next_sampling_policy=next_policy,
             mask=self.mask,
         )
 
@@ -147,43 +196,126 @@ class Frontier(eqx.Module):
         if max_width < 1 or max_width > vocabulary_size:
             raise ValueError("max_width must be between 1 and vocabulary size.")
 
-        flat_policy = self.sampling_policy.reshape((batch_size, active_size), (batch_size * active_size,))
-        flat_keys = jnp.broadcast_to(self.gumbel_keys[:, None], (batch_size, active_size)).reshape(
-            batch_size * active_size,
-        )
-        flat_positions = self.gumbel_positions.reshape(batch_size * active_size)
-        flat_node_ids = self.gumbel_node_ids.reshape(batch_size * active_size)
-        flat_logits = logits.reshape(batch_size * active_size, vocabulary_size)
-        flat_widths = jnp.clip(widths, 0, max_width).reshape(batch_size * active_size)
-        flat_mask = self.mask.reshape(batch_size * active_size)
+        widths = jnp.clip(widths, 0, max_width)
 
-        processed_logits, token_ids, child_policy, child_mask = jax.vmap(
-            sample_top_k_with_policy,
-            in_axes=(0, 0, 0, 0, 0, 0, 0, None),
-        )(
-            flat_policy,
-            flat_logits,
-            flat_keys,
-            flat_positions,
-            flat_node_ids,
-            flat_mask,
-            flat_widths,
-            max_width,
+        if self.base_token_counts is None:
+            flat_policy = self.sampling_policy.reshape((batch_size, active_size), (batch_size * active_size,))
+            flat_keys = jnp.broadcast_to(self.gumbel_keys[:, None], (batch_size, active_size)).reshape(
+                batch_size * active_size,
+            )
+            flat_positions = self.gumbel_positions.reshape(batch_size * active_size)
+            flat_node_ids = self.gumbel_node_ids.reshape(batch_size * active_size)
+            flat_logits = logits.reshape(batch_size * active_size, vocabulary_size)
+            flat_widths = widths.reshape(batch_size * active_size)
+            flat_mask = self.mask.reshape(batch_size * active_size)
+            processed_logits, token_ids, child_policy, child_mask = jax.vmap(
+                sample_top_k_with_policy,
+                in_axes=(0, 0, 0, 0, 0, 0, 0, None),
+            )(
+                flat_policy,
+                flat_logits,
+                flat_keys,
+                flat_positions,
+                flat_node_ids,
+                flat_mask,
+                flat_widths,
+                max_width,
+            )
+            token_ids = token_ids.reshape(batch_size, active_size, max_width)
+            child_mask = child_mask.reshape(batch_size, active_size, max_width)
+            return SampledFrontier(
+                processed_logits=processed_logits.reshape(batch_size, active_size, vocabulary_size),
+                parent_indices=jnp.broadcast_to(
+                    self.node_indices[:, :, None],
+                    (batch_size, active_size, max_width),
+                ),
+                token_ids=token_ids,
+                depths=jnp.broadcast_to(self.depths[:, :, None] + 1, (batch_size, active_size, max_width)),
+                gumbel_positions=jnp.broadcast_to(
+                    self.gumbel_positions[:, :, None] + 1,
+                    (batch_size, active_size, max_width),
+                ),
+                mask=child_mask,
+                sampling_policy=child_policy.reshape(
+                    (batch_size * active_size, max_width),
+                    (batch_size, active_size, max_width),
+                ),
+                path_token_ids=jnp.zeros((batch_size, active_size, max_width, 0), dtype=jnp.int32),
+                path_mask=jnp.zeros((batch_size, active_size, max_width, 0), dtype=jnp.bool),
+            )
+
+        def sample_batch(
+            policy: SamplingPolicy,
+            batch_base_token_counts: Int[Array, " count_vocabulary"],
+            batch_path_token_ids: Int[Array, "active depth"],
+            batch_path_mask: Bool[Array, "active depth"],
+            batch_logits: Float[Array, "active vocabulary"],
+            batch_key: Key[Array, ""],
+            batch_gumbel_positions: Int[Array, " active"],
+            batch_gumbel_node_ids: Int[Array, " active"],
+            batch_mask: Bool[Array, " active"],
+            batch_widths: Int[Array, " active"],
+        ) -> tuple[
+            Float[Array, "active vocabulary"],
+            Int[Array, "active width"],
+            SamplingPolicy,
+            Bool[Array, "active width"],
+        ]:
+            return jax.vmap(
+                sample_top_k_with_count_delta,
+                in_axes=(0, None, 0, 0, 0, None, 0, 0, 0, 0, None),
+            )(
+                policy,
+                batch_base_token_counts,
+                batch_path_token_ids,
+                batch_path_mask,
+                batch_logits,
+                batch_key,
+                batch_gumbel_positions,
+                batch_gumbel_node_ids,
+                batch_mask,
+                batch_widths,
+                max_width,
+            )
+
+        processed_logits, token_ids, child_policy, child_mask = jax.vmap(sample_batch)(
+            self.sampling_policy,
+            self.base_token_counts,
+            self.path_token_ids,
+            self.path_mask,
+            logits,
+            self.gumbel_keys,
+            self.gumbel_positions,
+            self.gumbel_node_ids,
+            self.mask,
+            widths,
         )
+        parent_path_token_ids = jnp.broadcast_to(
+            self.path_token_ids[:, :, None],
+            (batch_size, active_size, max_width, self.path_token_ids.shape[-1]),
+        )
+        parent_path_mask = jnp.broadcast_to(
+            self.path_mask[:, :, None],
+            (batch_size, active_size, max_width, self.path_mask.shape[-1]),
+        )
+        path_token_ids = jnp.concatenate(
+            [parent_path_token_ids, jnp.where(child_mask, token_ids, 0)[:, :, :, None]],
+            axis=-1,
+        )
+        path_mask = jnp.concatenate([parent_path_mask, child_mask[:, :, :, None]], axis=-1)
         return SampledFrontier(
             processed_logits=processed_logits.reshape(batch_size, active_size, vocabulary_size),
             parent_indices=jnp.broadcast_to(self.node_indices[:, :, None], (batch_size, active_size, max_width)),
-            token_ids=token_ids.reshape(batch_size, active_size, max_width),
+            token_ids=token_ids,
             depths=jnp.broadcast_to(self.depths[:, :, None] + 1, (batch_size, active_size, max_width)),
             gumbel_positions=jnp.broadcast_to(
                 self.gumbel_positions[:, :, None] + 1,
                 (batch_size, active_size, max_width),
             ),
-            mask=child_mask.reshape(batch_size, active_size, max_width),
-            sampling_policy=child_policy.reshape(
-                (batch_size * active_size, max_width),
-                (batch_size, active_size, max_width),
-            ),
+            mask=child_mask,
+            sampling_policy=child_policy,
+            path_token_ids=path_token_ids,
+            path_mask=path_mask,
         )
 
     def take(self, active_indices: Int[Array, " next_active"]) -> Frontier:
@@ -199,6 +331,9 @@ class Frontier(eqx.Module):
                 lambda value: value[:, active_indices] if eqx.is_array(value) else value,
                 self.sampling_policy,
             ),
+            base_token_counts=self.base_token_counts,
+            path_token_ids=self.path_token_ids[:, active_indices],
+            path_mask=self.path_mask[:, active_indices],
             gumbel_keys=self.gumbel_keys,
         )
 
@@ -211,6 +346,7 @@ class TrieProposal(eqx.Module):
     gumbel_node_ids: Int[Array, "batch nodes"]
     node_mask: Bool[Array, "batch nodes"]
     sampling_policies: SamplingPolicy
+    base_token_counts: Int[Array, "batch vocabulary"] | None
     gumbel_keys: Key[Array, " batch"]
     vocabulary_size: int = eqx.field(static=True)
     num_nodes: int = eqx.field(static=True)
@@ -232,6 +368,10 @@ class TrieProposal(eqx.Module):
         gumbel_positions = jnp.zeros((batch_size, budget), dtype=jnp.int32)
         gumbel_node_ids = jnp.zeros((batch_size, budget), dtype=jnp.int32)
         node_mask = jnp.zeros((batch_size, budget), dtype=jnp.bool)
+        base_token_counts = sampling_policy.token_counts
+        if base_token_counts is None and sampling_policy.has_count_penalties:
+            base_token_counts = jnp.zeros((batch_size, vocabulary_size), dtype=jnp.int32)
+        sampling_policy = sampling_policy.with_token_counts(None)
         sampling_policies = jax.tree.map(
             lambda value: (
                 jnp.broadcast_to(value[:, None], (batch_size, budget, *value.shape[1:]))
@@ -248,6 +388,7 @@ class TrieProposal(eqx.Module):
             gumbel_node_ids=gumbel_node_ids,
             node_mask=node_mask.at[:, 0].set(True),
             sampling_policies=sampling_policies,
+            base_token_counts=base_token_counts,
             gumbel_keys=gumbel_keys,
             vocabulary_size=vocabulary_size,
             num_nodes=1,
@@ -265,6 +406,9 @@ class TrieProposal(eqx.Module):
                 lambda value: value[:, None] if eqx.is_array(value) else value,
                 sampling_policy,
             ),
+            base_token_counts=base_token_counts,
+            path_token_ids=jnp.zeros((batch_size, 1, 0), dtype=jnp.int32),
+            path_mask=jnp.zeros((batch_size, 1, 0), dtype=jnp.bool),
             gumbel_keys=gumbel_keys,
         )
         return proposal, frontier
@@ -325,11 +469,13 @@ class TrieProposal(eqx.Module):
             ),
             node_mask=self.node_mask.at[batch_indices, node_indices].set(mask, mode="drop"),
             sampling_policies=sampling_policies,
+            base_token_counts=self.base_token_counts,
             gumbel_keys=self.gumbel_keys,
             vocabulary_size=self.vocabulary_size,
             num_nodes=min(self.num_nodes + child_slots, self.budget),
             max_depth=self.max_depth + 1,
         )
+        path_length = sampled.path_token_ids.shape[-1]
         child_frontier = Frontier(
             node_indices=jnp.where(mask, jnp.broadcast_to(node_indices, (batch_size, child_slots)), 0),
             parent_indices=jnp.where(mask, parent_indices, -1),
@@ -339,26 +485,67 @@ class TrieProposal(eqx.Module):
             gumbel_node_ids=jnp.where(mask, gumbel_node_ids, 0),
             mask=mask,
             sampling_policy=sampling_policy,
+            base_token_counts=self.base_token_counts,
+            path_token_ids=sampled.path_token_ids.reshape(batch_size, child_slots, path_length),
+            path_mask=sampled.path_mask.reshape(batch_size, child_slots, path_length),
             gumbel_keys=self.gumbel_keys,
         )
         return proposal, child_frontier
 
     def all_nodes_frontier(self) -> Frontier:
         node_indices = jnp.broadcast_to(
+            jnp.arange(self.num_nodes, dtype=jnp.int32)[None, :],
+            (self.batch_size, self.num_nodes),
+        )
+        if self.base_token_counts is None:
+            path_token_ids = jnp.zeros((self.batch_size, self.num_nodes, 0), dtype=jnp.int32)
+            path_mask = jnp.zeros((self.batch_size, self.num_nodes, 0), dtype=jnp.bool)
+        else:
+            path_token_ids, path_mask = self.path_tokens()
+            path_token_ids = path_token_ids[:, : self.num_nodes]
+            path_mask = path_mask[:, : self.num_nodes]
+        return Frontier(
+            node_indices=node_indices,
+            parent_indices=self.parent_indices[:, : self.num_nodes],
+            token_ids=self.token_ids[:, : self.num_nodes],
+            depths=self.depths[:, : self.num_nodes],
+            gumbel_positions=self.gumbel_positions[:, : self.num_nodes],
+            gumbel_node_ids=self.gumbel_node_ids[:, : self.num_nodes],
+            mask=self.node_mask[:, : self.num_nodes],
+            sampling_policy=jax.tree.map(
+                lambda value: value[:, : self.num_nodes] if eqx.is_array(value) else value,
+                self.sampling_policies,
+            ),
+            base_token_counts=self.base_token_counts,
+            path_token_ids=path_token_ids,
+            path_mask=path_mask,
+            gumbel_keys=self.gumbel_keys,
+        )
+
+    def path_tokens(self) -> tuple[Int[Array, "batch nodes depth"], Bool[Array, "batch nodes depth"]]:
+        node_indices = jnp.broadcast_to(
             jnp.arange(self.budget, dtype=jnp.int32)[None, :],
             (self.batch_size, self.budget),
         )
-        return Frontier(
-            node_indices=node_indices,
-            parent_indices=self.parent_indices,
-            token_ids=self.token_ids,
-            depths=self.depths,
-            gumbel_positions=self.gumbel_positions,
-            gumbel_node_ids=self.gumbel_node_ids,
-            mask=self.node_mask,
-            sampling_policy=self.sampling_policies,
-            gumbel_keys=self.gumbel_keys,
+        batch_indices = jnp.arange(self.batch_size, dtype=jnp.int32)[:, None]
+
+        def scan_step(
+            current_node_indices: Int[Array, "batch nodes"],
+            _: None,
+        ) -> tuple[Int[Array, "batch nodes"], tuple[Int[Array, "batch nodes"], Bool[Array, "batch nodes"]]]:
+            safe_node_indices = jnp.clip(current_node_indices, 0, self.budget - 1)
+            valid = (current_node_indices > 0) & self.node_mask[batch_indices, safe_node_indices]
+            token_ids = self.token_ids[batch_indices, safe_node_indices]
+            parent_indices = self.parent_indices[batch_indices, safe_node_indices]
+            return jnp.where(valid, parent_indices, 0), (token_ids, valid)
+
+        _, (path_token_ids, path_mask) = jax.lax.scan(
+            scan_step,
+            node_indices,
+            xs=None,
+            length=self.max_depth,
         )
+        return path_token_ids.swapaxes(0, 1).swapaxes(1, 2), path_mask.swapaxes(0, 1).swapaxes(1, 2)
 
     def sample(
         self,
@@ -373,15 +560,21 @@ class TrieProposal(eqx.Module):
         self,
         next_token_positions: Int[Array, " batch"],
     ) -> ProposalInputs:
-        token_positions = next_token_positions[:, None] + self.depths
+        token_ids = self.token_ids[:, : self.num_nodes]
+        depths = self.depths[:, : self.num_nodes]
+        token_positions = next_token_positions[:, None] + depths
         forward_pass_mode = ForwardPassMode.MULTI_TOKEN
         if self.num_nodes == 1:
             forward_pass_mode = ForwardPassMode.SINGLE_TOKEN
         attention_parent_indices = None
         if self.num_nodes > 1:
-            attention_parent_indices = jnp.where(self.node_mask, self.parent_indices, -1)
+            attention_parent_indices = jnp.where(
+                self.node_mask[:, : self.num_nodes],
+                self.parent_indices[:, : self.num_nodes],
+                -1,
+            )
         return ProposalInputs(
-            token_ids=self.token_ids,
+            token_ids=token_ids,
             token_positions=token_positions,
             lengths_without_padding=jnp.full((self.batch_size,), self.num_nodes, dtype=jnp.int32),
             forward_pass_mode=forward_pass_mode,
@@ -463,6 +656,37 @@ class TrieProposal(eqx.Module):
             axis=1,
         )
         bonus_token_ids = sampled_token_ids[batch_indices, terminal_node_indices]
+        next_sampling_policy = sampling_policy_at(terminal_node_indices)
+        if self.base_token_counts is not None:
+            accepted_child_token_ids = accepted_token_ids[:, 1:]
+            accepted_child_slots = jnp.arange(self.max_depth, dtype=jnp.int32)[None, :]
+            accepted_child_mask = accepted_child_slots < (num_compact_indices - 1)[:, None]
+            counted_token_ids = jnp.concatenate(
+                [accepted_child_token_ids, bonus_token_ids[:, None]],
+                axis=1,
+            )
+            counted_mask = jnp.concatenate(
+                [
+                    accepted_child_mask,
+                    jnp.ones((self.batch_size, 1), dtype=jnp.bool),
+                ],
+                axis=1,
+            )
+            token_counts = jax.vmap(
+                lambda policy, base_counts, token_ids, mask: policy.token_counts_with_delta(
+                    base_counts,
+                    token_ids,
+                    mask,
+                ),
+            )(
+                next_sampling_policy,
+                self.base_token_counts,
+                counted_token_ids,
+                counted_mask,
+            )
+            next_sampling_policy = jax.vmap(
+                lambda policy, counts: policy.with_token_counts(counts),
+            )(next_sampling_policy, token_counts)
         return AcceptedProposal(
             accepted_token_ids=accepted_token_ids,
             node_indices=node_indices,
@@ -470,7 +694,7 @@ class TrieProposal(eqx.Module):
             num_compact_indices=num_compact_indices,
             terminal_node_indices=terminal_node_indices,
             bonus_token_ids=bonus_token_ids,
-            next_sampling_policy=sampling_policy_at(terminal_node_indices),
+            next_sampling_policy=next_sampling_policy,
         )
 
 
@@ -519,11 +743,77 @@ def sample_top_k_with_policy(
         jnp.int32,
     )
     child_mask = mask & (jnp.arange(max_width, dtype=jnp.int32) < width)
+    child_policy = jax.tree.map(
+        lambda value: jnp.broadcast_to(value, (max_width, *value.shape)) if eqx.is_array(value) else value,
+        policy.with_token_counts(None),
+    )
+    return (
+        jnp.where(sample_mask, processed_logits, jnp.zeros_like(processed_logits)),
+        token_ids,
+        child_policy,
+        child_mask,
+    )
 
-    def count_token(token_id: Int[Array, ""], should_count: Bool[Array, ""]) -> SamplingPolicy:
-        return policy.with_next_token_count(token_id, should_count)
 
-    child_policy = jax.vmap(count_token)(token_ids, child_mask)
+def sample_one_with_count_delta(
+    policy: SamplingPolicy,
+    base_token_counts: Int[Array, " count_vocabulary"],
+    path_token_ids: Int[Array, " depth"],
+    path_mask: Bool[Array, " depth"],
+    logits: Float[Array, " vocabulary"],
+    key: Key[Array, ""],
+    position: Int[Array, ""],
+    node_id: Int[Array, ""],
+    mask: Bool[Array, ""],
+) -> tuple[Float[Array, " vocabulary"], Int[Array, ""], SamplingPolicy]:
+    sample_key = fold_gumbel_key(key, position, node_id)
+    safe_logits = jnp.where(mask, logits, jnp.zeros_like(logits))
+    count_policy = policy.with_token_counts(base_token_counts)
+    processed_logits, token_id, _next_policy = count_policy.sample(
+        safe_logits,
+        sample_key,
+        mask,
+        token_count_ids=path_token_ids,
+        token_count_mask=path_mask & mask,
+        update_token_counts=False,
+    )
+    return (
+        jnp.where(mask, processed_logits, jnp.zeros_like(processed_logits)),
+        jnp.where(mask, token_id, -1),
+        policy.with_token_counts(None),
+    )
+
+
+def sample_top_k_with_count_delta(
+    policy: SamplingPolicy,
+    base_token_counts: Int[Array, " count_vocabulary"],
+    path_token_ids: Int[Array, " depth"],
+    path_mask: Bool[Array, " depth"],
+    logits: Float[Array, " vocabulary"],
+    key: Key[Array, ""],
+    position: Int[Array, ""],
+    node_id: Int[Array, ""],
+    mask: Bool[Array, ""],
+    width: Int[Array, ""],
+    max_width: int,
+) -> tuple[Float[Array, " vocabulary"], Int[Array, " width"], SamplingPolicy, Bool[Array, " width"]]:
+    sample_key = fold_gumbel_key(key, position, node_id)
+    sample_mask = mask & (width > 0)
+    safe_logits = jnp.where(sample_mask, logits, jnp.zeros_like(logits))
+    count_policy = policy.with_token_counts(base_token_counts)
+    processed_logits = count_policy.process_logits(
+        safe_logits.astype(jnp.float32),
+        token_count_ids=path_token_ids,
+        token_count_mask=path_mask & sample_mask,
+    )
+    token_ids = jax.random.categorical(sample_key, processed_logits, shape=(max_width,), replace=False).astype(
+        jnp.int32,
+    )
+    child_mask = mask & (jnp.arange(max_width, dtype=jnp.int32) < width)
+    child_policy = jax.tree.map(
+        lambda value: jnp.broadcast_to(value, (max_width, *value.shape)) if eqx.is_array(value) else value,
+        policy.with_token_counts(None),
+    )
     return (
         jnp.where(sample_mask, processed_logits, jnp.zeros_like(processed_logits)),
         token_ids,

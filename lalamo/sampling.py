@@ -155,6 +155,54 @@ class SamplingPolicy(eqx.Module):
         count = (jnp.asarray(should_count) & in_vocabulary).astype(jnp.int32)
         return replace(self, token_counts=self.token_counts.at[token_id].add(count))
 
+    def with_token_counts(
+        self,
+        token_counts: Int[Array, "... vocabulary"] | None,
+    ) -> "SamplingPolicy":
+        return replace(self, token_counts=token_counts)
+
+    def token_counts_with_delta(
+        self,
+        base_token_counts: Int[Array, " vocabulary"],
+        token_ids: Int[Array, " tokens"],
+        token_mask: Bool[Array, " tokens"],
+    ) -> Int[Array, " vocabulary"]:
+        vocabulary_size = base_token_counts.shape[0]
+        in_vocabulary = (token_ids >= 0) & (token_ids < vocabulary_size)
+        safe_token_ids = jnp.clip(token_ids, 0, vocabulary_size - 1)
+        updates = (token_mask & in_vocabulary).astype(jnp.int32)
+        return base_token_counts.at[safe_token_ids].add(updates)
+
+    def with_token_count_delta(
+        self,
+        token_ids: Int[Array, " tokens"],
+        token_mask: Bool[Array, " tokens"],
+    ) -> "SamplingPolicy":
+        if self.token_counts is None:
+            return self
+        return replace(
+            self,
+            token_counts=self.token_counts_with_delta(self.token_counts, token_ids, token_mask),
+        )
+
+    def process_logits(
+        self,
+        logits: Float[Array, " vocabulary"],
+        token_count_ids: Int[Array, " tokens"] | None = None,
+        token_count_mask: Bool[Array, " tokens"] | None = None,
+    ) -> Float[Array, " vocabulary"]:
+        self._raise_if_batched()
+        logits = self._apply_banned_tokens(logits.astype(jnp.float32))
+        logits = self._apply_count_penalties(
+            logits,
+            token_count_ids,
+            token_count_mask,
+        )
+        logits = self._apply_temperature(logits)
+        logits = self._apply_top_k(logits)
+        logits = self._apply_top_p(logits)
+        return self._apply_min_p(logits)
+
     def broadcast(self, batch_size: int) -> "SamplingPolicy":
         def broadcast_leaf(leaf: object) -> object:
             if isinstance(leaf, jax.Array):
@@ -177,34 +225,41 @@ class SamplingPolicy(eqx.Module):
             self,
         )
 
-    def process_logits(self, logits: Float[Array, " vocabulary"]) -> Float[Array, " vocabulary"]:
-        self._raise_if_batched()
-        logits = self._apply_banned_tokens(logits)
-        logits = self._apply_repetition_penalty(logits)
-        logits = self._apply_presence_penalty(logits)
-        logits = self._apply_frequency_penalty(logits)
-        logits = self._apply_temperature(logits)
-        logits = self._apply_top_k(logits)
-        logits = self._apply_top_p(logits)
-        return self._apply_min_p(logits)
-
     def sample(
         self,
         logits: Float[Array, " vocabulary"],
         key: Key[Array, ""],
         should_count: Bool[Array, ""] | bool = True,
+        token_count_ids: Int[Array, " tokens"] | None = None,
+        token_count_mask: Bool[Array, " tokens"] | None = None,
+        update_token_counts: bool = True,
     ) -> tuple[Float[Array, " vocabulary"], Int[Array, ""], "SamplingPolicy"]:
-        processed_logits = self.process_logits(logits.astype(jnp.float32))
+        processed_logits = self.process_logits(
+            logits.astype(jnp.float32),
+            token_count_ids=token_count_ids,
+            token_count_mask=token_count_mask,
+        )
         token_id = jax.random.categorical(key, processed_logits).astype(jnp.int32)
-        return processed_logits, token_id, self.with_next_token_count(token_id, should_count)
+        next_policy = self
+        if update_token_counts:
+            if token_count_ids is not None and token_count_mask is not None:
+                next_policy = next_policy.with_token_count_delta(token_count_ids, token_count_mask)
+            next_policy = next_policy.with_next_token_count(token_id, should_count)
+        return processed_logits, token_id, next_policy
 
     def sample_top_k(
         self,
         logits: Float[Array, " vocabulary"],
         key: Key[Array, ""],
         k: int,
+        token_count_ids: Int[Array, " tokens"] | None = None,
+        token_count_mask: Bool[Array, " tokens"] | None = None,
     ) -> Int[Array, " k"]:
-        processed_logits = self.process_logits(logits.astype(jnp.float32))
+        processed_logits = self.process_logits(
+            logits.astype(jnp.float32),
+            token_count_ids=token_count_ids,
+            token_count_mask=token_count_mask,
+        )
         return jax.random.categorical(key, processed_logits, shape=(k,), replace=False).astype(jnp.int32)
 
     def __call__(self, logits: Float[Array, " vocabulary"], *, keychain: Keychain) -> Int[Array, ""]:
@@ -245,25 +300,67 @@ class SamplingPolicy(eqx.Module):
             return jnp.zeros(logits.shape, dtype=jnp.int32)
         return self.token_counts
 
-    def _apply_repetition_penalty(self, logits: Float[Array, " vocabulary"]) -> Float[Array, " vocabulary"]:
-        if self.repetition_penalty is None:
+    def _apply_count_penalties(
+        self,
+        logits: Float[Array, " vocabulary"],
+        token_ids: Int[Array, " tokens"] | None,
+        token_mask: Bool[Array, " tokens"] | None,
+    ) -> Float[Array, " vocabulary"]:
+        if not self.has_count_penalties:
             return logits
-        token_counts = self._token_counts_or_zeros(logits)
-        seen_token_mask = token_counts > 0
-        penalized_logits = jnp.where(logits > 0, logits / self.repetition_penalty, logits * self.repetition_penalty)
-        return jnp.where(seen_token_mask, penalized_logits, logits)
+        if token_ids is None or token_mask is None:
+            token_ids = jnp.zeros((0,), dtype=jnp.int32)
+            token_mask = jnp.zeros((0,), dtype=jnp.bool)
+        base_token_counts = self._token_counts_or_zeros(logits)
+        vocabulary_size = base_token_counts.shape[0]
+        safe_token_ids = jnp.clip(token_ids, 0, vocabulary_size - 1)
+        token_mask = token_mask & (token_ids >= 0) & (token_ids < vocabulary_size)
 
-    def _apply_presence_penalty(self, logits: Float[Array, " vocabulary"]) -> Float[Array, " vocabulary"]:
-        if self.presence_penalty is None:
-            return logits
-        token_counts = self._token_counts_or_zeros(logits)
-        return jnp.where(token_counts > 0, logits - self.presence_penalty, logits)
+        if self.repetition_penalty is not None:
+            logits = apply_repetition_penalty(logits, base_token_counts > 0, self.repetition_penalty)
+            new_path_token_mask = self._new_path_token_mask(base_token_counts, token_ids, token_mask)
+            path_logits = logits[safe_token_ids]
+            path_penalized_logits = apply_repetition_penalty(
+                path_logits,
+                new_path_token_mask,
+                self.repetition_penalty,
+            )
+            logits = logits.at[safe_token_ids].add(
+                jnp.where(new_path_token_mask, path_penalized_logits - path_logits, 0.0).astype(logits.dtype),
+            )
 
-    def _apply_frequency_penalty(self, logits: Float[Array, " vocabulary"]) -> Float[Array, " vocabulary"]:
-        if self.frequency_penalty is None:
-            return logits
-        token_counts = self._token_counts_or_zeros(logits).astype(logits.dtype)
-        return logits - self.frequency_penalty * token_counts
+        if self.presence_penalty is not None:
+            base_seen = base_token_counts > 0
+            logits = jnp.where(base_seen, logits - self.presence_penalty, logits)
+            new_path_token_mask = self._new_path_token_mask(base_token_counts, token_ids, token_mask)
+            logits = logits.at[safe_token_ids].add(
+                jnp.where(new_path_token_mask, -self.presence_penalty, 0.0).astype(logits.dtype),
+            )
+
+        if self.frequency_penalty is not None:
+            logits = logits - self.frequency_penalty * base_token_counts.astype(logits.dtype)
+            logits = logits.at[safe_token_ids].add(
+                jnp.where(token_mask, -self.frequency_penalty, 0.0).astype(logits.dtype),
+            )
+
+        return logits
+
+    def _new_path_token_mask(
+        self,
+        base_token_counts: Int[Array, " vocabulary"],
+        token_ids: Int[Array, " tokens"],
+        token_mask: Bool[Array, " tokens"],
+    ) -> Bool[Array, " tokens"]:
+        vocabulary_size = base_token_counts.shape[0]
+        safe_token_ids = jnp.clip(token_ids, 0, vocabulary_size - 1)
+        positions = jnp.arange(token_ids.shape[0], dtype=jnp.int32)
+        prior_same_token = jnp.any(
+            (positions[None, :] < positions[:, None])
+            & token_mask[None, :]
+            & (token_ids[None, :] == token_ids[:, None]),
+            axis=1,
+        )
+        return token_mask & (base_token_counts[safe_token_ids] == 0) & ~prior_same_token
 
     def _apply_temperature(self, logits: Float[Array, " vocabulary"]) -> Float[Array, " vocabulary"]:
         if self.temperature is None:
@@ -318,6 +415,15 @@ def _raise_if_different_batch_sizes(*arrays: SamplingLeaf) -> None:
     first_size = arrays[0].shape[0]
     if any(array.shape[0] != first_size for array in arrays):
         raise ValueError("init_batch iterable arguments must have the same length.")
+
+
+def apply_repetition_penalty(
+    logits: Float[Array, " vocabulary"],
+    seen_token_mask: Bool[Array, " vocabulary"],
+    repetition_penalty: Float[Array, ""],
+) -> Float[Array, " vocabulary"]:
+    penalized_logits = jnp.where(logits > 0, logits / repetition_penalty, logits * repetition_penalty)
+    return jnp.where(seen_token_mask, penalized_logits, logits)
 
 
 def canonicalize[T](
