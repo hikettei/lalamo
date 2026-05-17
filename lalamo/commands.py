@@ -79,7 +79,6 @@ class EvalDatasetName(StrEnum):
     GSM8K = "gsm8k"
     HUMANEVAL = "humaneval"
     MATH500 = "math500"
-    MERGED = "merged"
 
 
 @dataclass(frozen=True)
@@ -115,7 +114,7 @@ class EvalStats:
 
 @dataclass(frozen=True)
 class EvalConfig:
-    dataset_name: EvalDatasetName
+    dataset_names: tuple[EvalDatasetName, ...]
     model_path: Path
     speculator_path: Path | None
     num_questions: int
@@ -177,7 +176,7 @@ class EvalCounts:
 
 
 def load_eval_questions(
-    name: EvalDatasetName,
+    names: tuple[EvalDatasetName, ...],
     num_questions: int | None,
     mtbench_cache_path: Path,
 ) -> list[EvalQuestion]:
@@ -215,44 +214,33 @@ def load_eval_questions(
             for idx, row in enumerate(rows)
         ]
 
-    def merged() -> list[EvalQuestion]:
-        sources = (
-            ("gsm8k", gsm8k()),
-            ("mtbench", mtbench()),
-            ("math500", math500()),
+    loaders = {
+        EvalDatasetName.MTBENCH: mtbench,
+        EvalDatasetName.GSM8K: gsm8k,
+        EvalDatasetName.HUMANEVAL: humaneval,
+        EvalDatasetName.MATH500: math500,
+    }
+    source_questions = tuple((name, loaders[name]()) for name in names)
+    groups = (
+        tuple(
+            EvalQuestion(id=question.id, category=f"{name.value}/{question.category}", prompt=question.prompt)
+            for question in questions
         )
-        groups = (
-            tuple(
-                EvalQuestion(id=question.id, category=f"{source}/{question.category}", prompt=question.prompt)
-                for question in questions
-            )
-            for source, questions in sources
+        for name, questions in source_questions
+    )
+    questions = [
+        EvalQuestion(id=idx, category=question.category, prompt=question.prompt)
+        for idx, question in enumerate(
+            question for row in zip_longest(*groups) for question in row if question is not None
         )
-        return [
-            EvalQuestion(id=idx, category=question.category, prompt=question.prompt)
-            for idx, question in enumerate(
-                question for row in zip_longest(*groups) for question in row if question is not None
-            )
-        ]
-
-    match name:
-        case EvalDatasetName.MTBENCH:
-            questions = mtbench()
-        case EvalDatasetName.GSM8K:
-            questions = gsm8k()
-        case EvalDatasetName.HUMANEVAL:
-            questions = humaneval()
-        case EvalDatasetName.MATH500:
-            questions = math500()
-        case EvalDatasetName.MERGED:
-            questions = merged()
+    ]
 
     return questions if num_questions is None else questions[:num_questions]
 
 
 def evaluate_speculator(
     model_path: Path,
-    dataset_name: EvalDatasetName,
+    dataset_names: tuple[EvalDatasetName, ...],
     speculator_path: Path | None,
     mtbench_cache_path: Path,
     num_questions: int | None = None,
@@ -267,7 +255,7 @@ def evaluate_speculator(
     if max_output_length < 1:
         raise ValueError("max_output_length must be at least 1.")
 
-    questions = load_eval_questions(dataset_name, num_questions, mtbench_cache_path)
+    questions = load_eval_questions(dataset_names, num_questions, mtbench_cache_path)
     if not questions:
         raise ValueError("Evaluation dataset is empty.")
     total_questions = len(questions)
@@ -326,7 +314,7 @@ def evaluate_speculator(
 
     return EvalResults(
         config=EvalConfig(
-            dataset_name=dataset_name,
+            dataset_names=dataset_names,
             model_path=model_path,
             speculator_path=speculator_path,
             num_questions=total_questions,

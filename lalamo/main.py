@@ -603,7 +603,8 @@ def server(
 def print_speculator_eval_results(results: EvalResults) -> None:
     config = results.config
     speculator_name = config.speculator_path.name if config.speculator_path is not None else "no-speculator"
-    label = f"{config.dataset_name.value}, {speculator_name}"
+    dataset_label = ",".join(name.value for name in config.dataset_names)
+    label = f"{dataset_label}, {speculator_name}"
     config_table = Table(
         title=f"Speculator eval config ({label})",
         show_header=True,
@@ -612,7 +613,7 @@ def print_speculator_eval_results(results: EvalResults) -> None:
     )
     config_table.add_column("Key")
     config_table.add_column("Value")
-    config_table.add_row("dataset", config.dataset_name.value)
+    config_table.add_row("dataset", dataset_label)
     config_table.add_row("model_path", str(config.model_path))
     config_table.add_row("speculator", str(config.speculator_path) if config.speculator_path is not None else "none")
     config_table.add_row("questions", str(config.num_questions))
@@ -659,6 +660,17 @@ def print_speculator_eval_results(results: EvalResults) -> None:
     console.print(table)
 
 
+def parse_eval_dataset_names(value: str) -> tuple[EvalDatasetName, ...]:
+    names = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not names:
+        raise ValueError("--dataset must specify at least one dataset.")
+    available = {dataset.value: dataset for dataset in EvalDatasetName}
+    unknown = tuple(name for name in names if name not in available)
+    if unknown:
+        raise ValueError(f"Unknown eval dataset(s): {', '.join(unknown)}. Available: {', '.join(sorted(available))}.")
+    return tuple(available[name] for name in names)
+
+
 @speculator_app.command("eval", help="Evaluate speculative decoding MAL and throughput.")
 def eval_speculator(
     model_path: Annotated[
@@ -681,9 +693,9 @@ def eval_speculator(
         ),
     ] = None,
     dataset_name: Annotated[
-        EvalDatasetName,
-        Option("--dataset", help="Evaluation dataset."),
-    ] = EvalDatasetName.MERGED,
+        str,
+        Option("--dataset", help="Comma-separated evaluation datasets: mtbench,gsm8k,humaneval,math500."),
+    ] = "gsm8k,mtbench,math500",
     num_questions: Annotated[
         int | None,
         Option("--num_questions", "--num-questions", help="Number of questions to evaluate."),
@@ -727,7 +739,7 @@ def eval_speculator(
         cache_path = mtbench_cache_path or Path.home() / ".cache" / "lalamo" / "eval" / "mt_bench_questions.jsonl"
         results = _evaluate_speculator(
             model_path=model_path,
-            dataset_name=dataset_name,
+            dataset_names=parse_eval_dataset_names(dataset_name),
             speculator_path=speculator_path,
             mtbench_cache_path=cache_path,
             num_questions=num_questions,
