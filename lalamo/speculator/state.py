@@ -425,13 +425,24 @@ class LMState(eqx.Module):
             jnp.arange(accepted.terminal_node_indices.shape[0], dtype=jnp.int32),
             accepted.terminal_node_indices,
         ]
-        return LMState(
-            kv_cache=kv_cache,
-            next_token_position=self.next_token_position + accepted.num_compact_indices,
-            root_bonus_id=accepted.bonus_token_ids,
-            root_sample_logits=root_sample_logits,
-            sampling_policy=accepted.next_sampling_policy,
-            gumbel_keys=self.gumbel_keys,
-            output_lengths=self.output_lengths + accepted.num_compact_indices,
-            memory=memory,
+        return eqx.tree_at(
+            lambda state: (
+                state.kv_cache,
+                state.next_token_position,
+                state.root_bonus_id,
+                state.root_sample_logits,
+                state.sampling_policy,
+                state.output_lengths,
+                state.memory,
+            ),
+            self,
+            (
+                kv_cache,
+                self.next_token_position + accepted.num_compact_indices,
+                accepted.bonus_token_ids,
+                root_sample_logits,
+                accepted.next_sampling_policy,
+                self.output_lengths + accepted.num_compact_indices,
+                memory,
+            ),
         )

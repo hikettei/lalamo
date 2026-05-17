@@ -5,10 +5,12 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import msgpack
+from jaxtyping import Array, Int, Key
 
 from lalamo.modules.decoder import Decoder
+from lalamo.sampling import SamplingPolicy
 from lalamo.speculator.proposal import TrieProposal
-from lalamo.speculator.state import LMState, MemoryBuffers, RingBuffer, StateRequest
+from lalamo.speculator.state import LMState, MemoryBuffers, PrefillResults, RingBuffer, StateRequest
 from lalamo.utils.registry_abc import RegistryABC
 
 __all__ = [
@@ -17,6 +19,7 @@ __all__ = [
     "LMState",
     "MemoryBuffers",
     "NoSpeculator",
+    "PrefillResults",
     "RingBuffer",
     "Speculator",
     "SpeculatorBackend",
@@ -37,6 +40,20 @@ class Speculator(ABC):
     @property
     def state_request(self) -> StateRequest:
         return StateRequest()
+
+    def init_state(
+        self,
+        prefill_results: PrefillResults,
+        next_token_position: Int[Array, " batch"],
+        sampling_policy: SamplingPolicy,
+        gumbel_keys: Key[Array, " batch"],
+    ) -> LMState:
+        return LMState.from_prefill(
+            prefill_results,
+            next_token_position,
+            sampling_policy,
+            gumbel_keys,
+        )
 
     @abstractmethod
     def draft(self, state: LMState) -> TrieProposal: ...

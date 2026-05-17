@@ -325,7 +325,7 @@ class LanguageModel(Model[ChatCodecConfig, LanguageModelConfig, ChatCodec]):
             (batch_size,),
             mode=KeychainBroadcastMode.SUFFIX,
         ).vmapped_keys
-        initial_lm_state = LMState.from_prefill(
+        initial_lm_state = active_speculator.init_state(
             prefill_results,
             prompt_lengths_without_padding,
             sampling_policy,
