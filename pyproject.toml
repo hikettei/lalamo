@@ -77,6 +77,7 @@ lalamo = "lalamo.main:app"
 [project.entry-points."lalamo.speculator_backends"]
 ngram = "lalamo.speculator.proposers.ngram"
 mlp = "lalamo.speculator.proposers.mlp"
+dflash = "lalamo.speculator.proposers.dflash"
 
 [build-system]
 requires = ["setuptools>=65.5.0", "wheel"]
