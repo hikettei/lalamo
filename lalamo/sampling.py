@@ -20,6 +20,7 @@ type SamplingLeaf = Float[Array, "..."] | Int[Array, "..."]
 class SamplingPolicy(eqx.Module):
     temperature: Float[Array, "*batch"] | None = None
     top_k: Int[Array, "*batch"] | None = None
+    top_k_limit: int | None = eqx.field(static=True, default=None)
     top_p: Float[Array, "*batch"] | None = None
     min_p: Float[Array, "*batch"] | None = None
     banned_tokens: Int[Array, "*batch max_banned_tokens"] | None = None
@@ -51,6 +52,7 @@ class SamplingPolicy(eqx.Module):
                 None if temperature is None or temperature == 1.0 else jnp.asarray(temperature, dtype=jnp.float32)
             ),
             top_k=None if top_k is None or top_k <= 0 else jnp.asarray(top_k, dtype=jnp.int32),
+            top_k_limit=None if top_k is None or top_k <= 0 else int(top_k),
             top_p=None if top_p is None or top_p >= 1.0 else jnp.asarray(top_p, dtype=jnp.float32),
             min_p=None if min_p is None or min_p <= 0.0 else jnp.asarray(min_p, dtype=jnp.float32),
             banned_tokens=(
@@ -110,6 +112,7 @@ class SamplingPolicy(eqx.Module):
         return cls(
             temperature=temperature,
             top_k=top_k,
+            top_k_limit=None,
             top_p=top_p,
             min_p=min_p,
             banned_tokens=banned_tokens_array,
@@ -379,14 +382,20 @@ class SamplingPolicy(eqx.Module):
             return logits
         (vocabulary_size,) = logits.shape
         effective_top_k = jnp.clip(self.top_k, 1, vocabulary_size)
-        sorted_logits = jnp.sort(logits, axis=-1, descending=True)
-        min_logit = sorted_logits[effective_top_k - 1]
+        if self.top_k_limit is None:
+            sorted_logits = jnp.sort(logits, axis=-1, descending=True)
+            min_logit = sorted_logits[effective_top_k - 1]
+        else:
+            top_values, _top_indices = jax.lax.top_k(logits, min(self.top_k_limit, vocabulary_size))
+            min_logit = top_values[effective_top_k - 1]
         filtered_logits = jnp.where(logits >= min_logit, logits, -jnp.inf)
         return jnp.where(self.top_k > 0, filtered_logits, logits)
 
     def _apply_top_p(self, logits: Float[Array, " vocabulary"]) -> Float[Array, " vocabulary"]:
         if self.top_p is None:
             return logits
+        if self.top_k_limit is not None:
+            return self._apply_top_p_inside_static_top_k(logits)
         sorted_indices = jnp.argsort(logits, axis=-1, descending=True)
         sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)
         cumulative_probs = jnp.cumsum(jax.nn.softmax(sorted_logits, axis=-1), axis=-1)
@@ -399,6 +408,18 @@ class SamplingPolicy(eqx.Module):
         to_remove_unsorted = jnp.take_along_axis(to_remove_sorted, unsort_indices, axis=-1)
 
         return jnp.where(to_remove_unsorted, -jnp.inf, logits)
+
+    def _apply_top_p_inside_static_top_k(self, logits: Float[Array, " vocabulary"]) -> Float[Array, " vocabulary"]:
+        assert self.top_k_limit is not None
+        assert self.top_p is not None
+        (vocabulary_size,) = logits.shape
+        top_values, top_indices = jax.lax.top_k(logits, min(self.top_k_limit, vocabulary_size))
+        cumulative_probs = jnp.cumsum(jax.nn.softmax(top_values, axis=-1), axis=-1)
+        to_remove = cumulative_probs > self.top_p
+        to_remove = jnp.roll(to_remove, shift=1, axis=-1)
+        to_remove = to_remove.at[0].set(False)
+        filtered_top_values = jnp.where(to_remove, -jnp.inf, top_values)
+        return jnp.full_like(logits, -jnp.inf).at[top_indices].set(filtered_top_values)
 
     def _apply_min_p(self, logits: Float[Array, " vocabulary"]) -> Float[Array, " vocabulary"]:
         if self.min_p is None:
