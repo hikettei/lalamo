@@ -1,16 +1,18 @@
+# ruff: noqa: ANN401
 from __future__ import annotations
 
 import struct
 from array import array
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from itertools import batched, chain, repeat, tee
+from itertools import chain, repeat, tee
 from math import exp, log
 from pathlib import Path
 from typing import Annotated, Any, Self
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import xxhash
 from typer import Option
 
@@ -327,6 +329,128 @@ class NGramModel:
         return cls(max_order=max_order, tables=tuple(tables), discount=discount)
 
 
+def ngram_nodes_from_context(
+    model: NGramModel,
+    recent_token_ids: jax.Array,
+    recent_token_mask: jax.Array,
+    root_bonus_ids: jax.Array,
+    width: int,
+    depth: int,
+    vocabulary_size: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    batch_size = root_bonus_ids.shape[0]
+    node_budget = width * depth
+    output_shape = jax.ShapeDtypeStruct((batch_size, node_budget), jnp.int32)
+    mask_shape = jax.ShapeDtypeStruct((batch_size, node_budget), jnp.bool)
+    return jax.pure_callback(
+        lambda token_ids, token_mask, bonus_ids: ngram_nodes_from_context_numpy(
+            model,
+            token_ids,
+            token_mask,
+            bonus_ids,
+            width,
+            depth,
+            vocabulary_size,
+        ),
+        (output_shape, output_shape, output_shape, mask_shape),
+        recent_token_ids,
+        recent_token_mask,
+        root_bonus_ids,
+        vmap_method="sequential",
+    )
+
+
+def ngram_nodes_from_context_numpy(
+    model: NGramModel,
+    recent_token_ids: Any,
+    recent_token_mask: Any,
+    root_bonus_ids: Any,
+    width: int,
+    depth: int,
+    vocabulary_size: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    recent_token_ids = np.asarray(recent_token_ids)
+    recent_token_mask = np.asarray(recent_token_mask)
+    root_bonus_ids = np.asarray(root_bonus_ids)
+    batch_size = root_bonus_ids.shape[0]
+    node_budget = width * depth
+    token_ids = np.zeros((batch_size, node_budget), dtype=np.int32)
+    parent_indices = np.full((batch_size, node_budget), -1, dtype=np.int32)
+    depths = np.zeros((batch_size, node_budget), dtype=np.int32)
+    node_mask = np.zeros((batch_size, node_budget), dtype=np.bool_)
+    for batch_index in range(batch_size):
+        context = [
+            int(token_id)
+            for token_id, valid in zip(
+                recent_token_ids[batch_index].tolist(),
+                recent_token_mask[batch_index].tolist(),
+                strict=True,
+            )
+            if bool(valid)
+        ]
+        context.append(int(root_bonus_ids[batch_index]))
+        row_token_ids, row_parent_indices, row_depths, row_mask = ngram_nodes_for_row_numpy(
+            model,
+            context,
+            width,
+            depth,
+            vocabulary_size,
+        )
+        token_ids[batch_index] = row_token_ids
+        parent_indices[batch_index] = row_parent_indices
+        depths[batch_index] = row_depths
+        node_mask[batch_index] = row_mask
+    return token_ids, parent_indices, depths, node_mask
+
+
+def ngram_nodes_for_row_numpy(
+    model: NGramModel,
+    root_context: list[int],
+    width: int,
+    depth: int,
+    vocabulary_size: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    node_budget = width * depth
+    token_ids = np.zeros((node_budget,), dtype=np.int32)
+    parent_indices = np.full((node_budget,), -1, dtype=np.int32)
+    node_depths = np.zeros((node_budget,), dtype=np.int32)
+    node_mask = np.zeros((node_budget,), dtype=np.bool_)
+    frontier: list[tuple[int, list[int]]] = [(0, root_context)]
+    node_count = 0
+    for depth_index in range(1, depth + 1):
+        next_frontier: list[tuple[int, list[int]]] = []
+        for parent_index, context in frontier:
+            if node_count >= node_budget:
+                break
+            probs = model.probs(context)
+            candidates = sorted(
+                (
+                    (int(token_id), float(probability))
+                    for token_id, probability in probs.items()
+                    if int(token_id) < vocabulary_size and probability > 0.0
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )[:width]
+            for token_id, _probability in candidates:
+                if node_count >= node_budget:
+                    break
+                node_index = node_count + 1
+                token_ids[node_count] = np.int32(token_id)
+                parent_indices[node_count] = np.int32(parent_index)
+                node_depths[node_count] = np.int32(depth_index)
+                node_mask[node_count] = True
+                next_context = [*context, token_id]
+                context_length = max(model.max_order - 1, 0)
+                if context_length > 0:
+                    next_context = next_context[-context_length:]
+                next_frontier.append((node_index, next_context))
+                node_count += 1
+        if not next_frontier or node_count >= node_budget:
+            break
+        frontier = next_frontier
+    return token_ids, parent_indices, node_depths, node_mask
+
+
 @dataclass(frozen=True, kw_only=True, eq=False)
 class NGramSpeculator(Speculator):
     model: NGramModel
@@ -351,57 +475,45 @@ class NGramSpeculator(Speculator):
         return StateRequest(token_id_capacity=max(self.model.max_order - 1, 0))
 
     def draft(self, state: LMState) -> TrieProposal:
-        proposal, frontier = state.create_root_proposal(budget=self.width * self.depth + 1)
-        contexts = [[context] for context in self.contexts(state)]
-
-        for _ in range(self.depth):
-            if proposal.num_nodes >= proposal.budget:
-                break
-            vocab_size = self.vocab_size(state)
-            if vocab_size == 0:
-                break
-
-            max_width = min(self.width, vocab_size)
-            frontier_mask = jax.device_get(frontier.mask).tolist()
-            row_probs = [[self.model.probs(context) for context in row_contexts] for row_contexts in contexts]
-            widths = jnp.asarray(
-                [
-                    [
-                        min(max_width, sum(token_id < vocab_size for token_id in probs)) if active else 0
-                        for probs, active in zip(row_probs_batch, frontier_mask_batch, strict=True)
-                    ]
-                    for row_probs_batch, frontier_mask_batch in zip(row_probs, frontier_mask, strict=True)
-                ],
-                dtype=jnp.int32,
-            )
-            if not any(width > 0 for row_widths in widths.tolist() for width in row_widths):
-                break
-
-            sampled = frontier.sample_top_k(
-                logits=self.logits_for_tree(row_probs, vocab_size),
-                widths=widths,
-                max_width=max_width,
-            )
-            proposal, frontier = proposal.add_frontier(sampled)
-            node_token_ids = jax.device_get(frontier.token_ids).tolist()
-            node_mask = jax.device_get(frontier.mask).tolist()
-            next_contexts = []
-            for row_contexts, row_token_ids, row_mask in zip(contexts, node_token_ids, node_mask, strict=True):
-                next_row_contexts = []
-                for context, child_token_ids, child_mask in zip(
-                    row_contexts,
-                    batched(row_token_ids, max_width),
-                    batched(row_mask, max_width),
-                    strict=True,
-                ):
-                    for token_id, valid in zip(child_token_ids, child_mask, strict=True):
-                        next_context = list(context)
-                        if valid:
-                            next_context.append(token_id)
-                        next_row_contexts.append(next_context)
-                next_contexts.append(next_row_contexts)
-            contexts = next_contexts
-        return proposal
+        node_budget = self.width * self.depth
+        proposal, _frontier = state.create_root_proposal(budget=node_budget + 1)
+        context_length = max(self.model.max_order - 1, 0)
+        if context_length > 0:
+            recent_token_ids, recent_token_mask = state.recent_token_ids(context_length)
+        else:
+            batch_size = state.root_bonus_id.shape[0]
+            recent_token_ids = jnp.zeros((batch_size, 0), dtype=jnp.int32)
+            recent_token_mask = jnp.zeros((batch_size, 0), dtype=jnp.bool)
+        token_ids, parent_indices, depths, node_mask = ngram_nodes_from_context(
+            self.model,
+            recent_token_ids,
+            recent_token_mask,
+            state.root_bonus_id,
+            self.width,
+            self.depth,
+            self.vocab_size(state),
+        )
+        batch_size = state.root_bonus_id.shape[0]
+        node_indices = jnp.arange(1, node_budget + 1, dtype=jnp.int32)[None, :]
+        root_gumbel_positions = state.next_token_position + 1
+        return TrieProposal(
+            token_ids=proposal.token_ids.at[:, 1:].set(jnp.where(node_mask, token_ids, 0)),
+            parent_indices=proposal.parent_indices.at[:, 1:].set(jnp.where(node_mask, parent_indices, -1)),
+            depths=proposal.depths.at[:, 1:].set(jnp.where(node_mask, depths, 0)),
+            gumbel_positions=proposal.gumbel_positions.at[:, 1:].set(
+                jnp.where(node_mask, root_gumbel_positions[:, None] + depths, 0),
+            ),
+            gumbel_node_ids=proposal.gumbel_node_ids.at[:, 1:].set(
+                jnp.where(node_mask, jnp.broadcast_to(node_indices, (batch_size, node_budget)), 0),
+            ),
+            node_mask=proposal.node_mask.at[:, 1:].set(node_mask),
+            sampling_policies=proposal.sampling_policies,
+            base_token_counts=proposal.base_token_counts,
+            gumbel_keys=proposal.gumbel_keys,
+            vocabulary_size=proposal.vocabulary_size,
+            num_nodes=node_budget + 1,
+            max_depth=self.depth,
+        )
 
     def contexts(self, state: LMState) -> list[list[int]]:
         root_bonus_ids = [int(token_id) for token_id in state.root_bonus_id.tolist()]
